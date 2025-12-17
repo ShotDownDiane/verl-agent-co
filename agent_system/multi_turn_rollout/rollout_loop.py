@@ -217,7 +217,7 @@ class TrajectoryCollector:
                 obs=obs,
             )
             processed_samples.append(processed)
-        
+            
         # Aggregate batch data
         batch = collate_fn(processed_samples)
         

@@ -49,13 +49,14 @@ def collate_fn(data_list: list[dict]) -> dict:
     tensors = defaultdict(list)
     non_tensors = defaultdict(list)
 
+
     for data in data_list:
         for key, val in data.items():
             if isinstance(val, torch.Tensor):
                 tensors[key].append(val)
             else:
                 non_tensors[key].append(val)
-
+                
     for key, val in tensors.items():
         tensors[key] = torch.stack(val, dim=0)
 
@@ -157,6 +158,10 @@ class RLHFDataset(Dataset):
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
 
     def __len__(self):
+        # In some multiprocessing setups the dataframe attribute may be missing
+        # after deserialization; rebuild if needed.
+        if not hasattr(self, "dataframe"):
+            self.resume_dataset_state()
         return len(self.dataframe)
 
     def _build_messages(self, example: dict):
@@ -182,6 +187,8 @@ class RLHFDataset(Dataset):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
+        if not hasattr(self, "dataframe"):
+            self.resume_dataset_state()
         row_dict: dict = self.dataframe[item]
         messages = self._build_messages(row_dict)
         model_inputs = {}

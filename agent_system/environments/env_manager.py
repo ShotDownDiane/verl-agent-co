@@ -21,8 +21,11 @@ from functools import partial
 import os
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
+from agent_system.environments.format_reward import compute_format_reward
 from agent_system.memory import SimpleMemory, SearchMemory
 from omegaconf import OmegaConf
+from types import SimpleNamespace
+from scipy.spatial import cKDTree
 
 def parse_gamefile(infos):
     gamefile = []
@@ -40,6 +43,116 @@ def set_gamefile(infos, gamefile):
         else:
             infos[i]['extra.gamefile'] = None
     return infos
+
+def _to_container(obj, resolve=True):
+    """Safely convert SimpleNamespace or OmegaConf object to dict/list.
+    
+    This helper function allows make_envs to work with both OmegaConf configs
+    (used in production) and SimpleNamespace objects (used in manual testing).
+    """
+    if isinstance(obj, SimpleNamespace):
+        # Convert SimpleNamespace to dict recursively
+        if hasattr(obj, '__dict__'):
+            result = {}
+            for key, value in obj.__dict__.items():
+                if isinstance(value, SimpleNamespace):
+                    result[key] = _to_container(value, resolve=resolve)
+                elif isinstance(value, (list, tuple)):
+                    result[key] = [
+                        _to_container(item, resolve=resolve) if isinstance(item, SimpleNamespace) else item
+                        for item in value
+                    ]
+                else:
+                    result[key] = value
+            return result
+        else:
+            return {}
+    else:
+        # Use OmegaConf.to_container for OmegaConf objects
+        return OmegaConf.to_container(obj, resolve=resolve)
+
+
+def calculate_k_operators_with_lowest_processing_time(instance: np.ndarray, k: int) -> List[List[Tuple[int, int, float]]]:
+    """
+    Calculates the k operators with the lowest processing time for each job.
+    This matches the implementation in LLMCoSolver.
+
+    Parameters
+    ----------
+    instance : np.ndarray
+        A JSSP instance with shape (num_jobs, 2*num_ops) where each operation is (machine, processing_time).
+    k : int
+        Number of operators to be calculated.
+
+    Returns
+    -------
+    List[List[Tuple[int, int, float]]]
+        A list of k operators with the lowest processing time for each job.
+        Each tuple contains (operator_index, machine_index, processing_time).
+    """
+    num_jobs, num_columns = instance.shape
+    num_machines = num_columns // 2
+    job_operators = {job: [] for job in range(num_jobs)}
+
+    # Iterate through each job and operator
+    for job_idx in range(num_jobs):
+        for op_idx in range(num_machines):
+            machine_idx = int(instance[job_idx, op_idx * 2])
+            processing_time = float(instance[job_idx, op_idx * 2 + 1])
+            job_operators[job_idx].append((op_idx, machine_idx, processing_time))
+
+    # Sort operators for each job by processing time and select the k operators with the lowest processing time
+    result = []
+    for job in range(num_jobs):
+        sorted_operators = sorted(job_operators[job], key=lambda x: x[2])  # Sort by processing time
+        result.append(sorted_operators[:k])  # Take the k operators with the lowest processing time
+
+    return result
+
+
+def calculate_top_k_nearest_nodes(nodes: np.ndarray, k: int = 2) -> List[List[Tuple[int, float]]]:
+    """
+    For each node, calculate its top k nearest neighbors using a k-d tree.
+    This matches the implementation in LLMCoSolver.
+
+    Parameters
+    ----------
+    nodes : np.ndarray
+        Coordinates of the nodes. Shape: (N, 2).
+    k : int, optional
+        Number of nearest neighbors to find for each node. Default is 2.
+
+    Returns
+    -------
+    List[List[Tuple[int, float]]]
+        A list of length N, where each element is a list of k tuples (neighbor_index, distance).
+    """
+    kdtree = cKDTree(nodes)
+    top_k_nearest_nodes = []
+    for node in nodes:
+        distances, indices = kdtree.query(node, k + 1)  # k+1 to include the node itself
+        # Handle scalar vs array return from kdtree.query
+        if k == 0:
+            # Edge case: k=0 means no neighbors
+            neighbors = []
+        elif k == 1:
+            # When k=1, kdtree.query may return scalars
+            if np.isscalar(distances):
+                # Only one result (the node itself), skip it
+                neighbors = []
+            else:
+                # Exclude the node itself (first index)
+                if len(distances) > 1:
+                    neighbors = [(int(indices[1]), float(distances[1]))]
+                else:
+                    neighbors = []
+        else:
+            # Exclude the node itself (first index)
+            distances = distances[1:]
+            indices = indices[1:]
+            neighbors = [(int(idx), float(dist)) for idx, dist in zip(indices, distances)]
+        top_k_nearest_nodes.append(neighbors)
+    return top_k_nearest_nodes
 
 
 class SearchEnvironmentManager(EnvironmentManagerBase):
@@ -116,6 +229,193 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
         return postprocess_text_obs
 
 
+class RL4COSchedulingEnvironmentManager(EnvironmentManagerBase):
+    """EnvironmentManager for RL4CO scheduling envs (JSSP / FFSP)."""
+
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+        self.one_step = False  # RL4CO scheduling uses step-by-step mode only
+        self.sched_env_name = getattr(
+            config.env.rl4co_scheduling, "env_name", "jssp"
+        ).lower()
+        # Format reward configuration
+        self.use_format_reward = getattr(config.env.rl4co_scheduling, "use_format_reward", False)
+        self.format_reward_weight = getattr(config.env.rl4co_scheduling, "format_reward_weight", 0.05)
+        self.feasibility_reward_weight = getattr(config.env.rl4co_scheduling, "feasibility_reward_weight", 0.15)
+        # Conditional reward mechanism parameters
+        self.use_conditional_reward = getattr(config.env.rl4co_scheduling, "use_conditional_reward", True)
+        self.feasibility_threshold = getattr(config.env.rl4co_scheduling, "feasibility_threshold", 0.9)
+        self.normalize_env_reward = getattr(config.env.rl4co_scheduling, "normalize_env_reward", True)
+        self.env_reward_range = getattr(config.env.rl4co_scheduling, "env_reward_range", None)
+        self.fixed_scale_reference = getattr(config.env.rl4co_scheduling, "fixed_scale_reference", None)
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs) -> Dict[str, Any]:
+        td, infos = self.envs.reset()
+        batch_size = td.batch_size[0] if td.batch_size else len(infos)
+        self.memory.reset(batch_size=batch_size)
+        self.pre_text_obs = [""] * batch_size
+
+        text_obs = self.build_text_obs(td, init=True)
+        observations = {"text": text_obs, "image": None, "anchor": text_obs}
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        next_td, env_rewards, dones, infos = self.envs.step(actions)
+
+        self.memory.store({"text_obs": self.pre_text_obs, "action": actions})
+        text_obs = self.build_text_obs(next_td, init=False)
+        self.pre_text_obs = text_obs
+
+        env_rewards = to_numpy(env_rewards)
+
+        # Compute format reward if enabled (for step-by-step mode)
+        format_bonuses = None
+        if self.use_format_reward:
+            format_bonuses = np.array([1.0 if v == 1 else 0.0 for v in valids], dtype=np.float32)
+            final_rewards = env_rewards + self.format_reward_weight * format_bonuses
+            rewards = final_rewards
+        else:
+            rewards = env_rewards
+
+        for i, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[i])
+            if self.use_format_reward and format_bonuses is not None:
+                info["format_bonus"] = float(format_bonuses[i])
+                info["env_reward"] = float(env_rewards[i])
+
+        dones = to_numpy(dones) if dones is not None else None
+
+        next_observations = {"text": text_obs, "image": None, "anchor": text_obs}
+        return next_observations, rewards, dones, infos
+
+    def _format_jssp_obs_single(self, td, idx: int, init: bool) -> str:
+        # Try to extract JSSP instance from TensorDict
+        # rl4co JSSP environment may store instance data in different keys
+        # We'll try to reconstruct from available keys or use a fallback
+        
+        num_jobs = 0
+        num_machines = 0
+        num_ops = 0
+        
+        # Try to get dimensions from TensorDict
+        if "next_op" in td.keys():
+            num_jobs = td["next_op"][idx].shape[0]
+        if "ma_assignment" in td.keys():
+            ma_assign = td["ma_assignment"][idx]
+            if ma_assign.numel() > 0:
+                num_machines = int(ma_assign.max().item()) + 1
+                # Estimate num_ops from ma_assignment shape
+                if len(ma_assign.shape) > 1:
+                    num_ops = ma_assign.shape[-1]
+                else:
+                    num_ops = num_machines  # fallback
+        
+        # Try to get instance data from generator or other sources
+        instance_data = None
+        base_env = getattr(self.envs, "base_env", None) or getattr(getattr(self.envs, "inner_env", None), "base_env", None)
+        if base_env is not None and hasattr(base_env, "generator") and hasattr(base_env.generator, "data"):
+            # Try to get instance from generator
+            gen_data = base_env.generator.data
+            if gen_data is not None and len(gen_data) > idx:
+                instance_data = gen_data[idx]
+        
+        # If we have instance data, format it according to LLMCoSolver
+        if instance_data is not None:
+            instance_np = instance_data.cpu().numpy() if isinstance(instance_data, torch.Tensor) else instance_data
+            k = getattr(self.config.env.rl4co_scheduling, "k", 2)
+            k_operations_with_lowest_processing_time = calculate_k_operators_with_lowest_processing_time(instance_np, k)
+            
+            # Format job descriptions (matching LLMCoSolver format exactly)
+            job_descriptions = []
+            for job_idx in range(num_jobs):
+                job_info = instance_np[job_idx].tolist()
+                job_info_reformated = []
+                for op_idx in range(num_ops):
+                    job_info_reformated.append((int(job_info[2 * op_idx]), int(job_info[2 * op_idx + 1])))
+                lowest_str = [f"{op_info[0]}: ({op_info[1]}, {op_info[2]})" for op_info in k_operations_with_lowest_processing_time[job_idx]]
+                job_desc = (
+                    f"Job {job_idx}, machines and processing times for operations: {job_info_reformated}, "
+                    f"operators with lowest processing time: {lowest_str}; "
+                ).replace("'", "")
+                job_descriptions.append(job_desc)
+            
+            job_descriptions_str = "".join(job_descriptions)
+            # Replace last semicolon with period (matching LLMCoSolver)
+            job_descriptions_str = ".".join(job_descriptions_str.rsplit(";", 1))
+        else:
+            # Fallback: create a simplified description
+            job_descriptions_str = f"Job information not available. There are {num_jobs} jobs and {num_machines} machines."
+
+        obs = RL4CO_JSSP_TEMPLATE_NO_HIS.format(
+            num_jobs=num_jobs,
+            num_machines=num_machines,
+            num_ops=num_ops,
+            job_descriptions=job_descriptions_str,
+        )
+
+        return obs
+
+    def _format_ffsp_obs_single(self, td, idx: int, init: bool) -> str:
+        # FFSPEnv exposes high-level schedule state; we focus on counts.
+        job_loc = td["job_location"][idx]  # shape [num_jobs+1] (last may be dummy)
+        num_jobs = job_loc.shape[-1] - 1
+
+        # We don't have direct per-stage times here; summarize generically.
+        num_stages = int(td.get("num_stage", torch.tensor(0))[0].item()) if "num_stage" in td.keys() else "unknown"
+        machines_per_stage = []
+
+        job_stage_times = f"There are {num_jobs} jobs and {num_stages} stages. Each job must be processed at each stage in order."
+
+        current_time = float(td.get("time_idx", torch.tensor(0.0))[idx].item()) if "time_idx" in td.keys() else 0.0
+
+        if init or self.config.env.history_length <= 0:
+            obs = RL4CO_FFSP_TEMPLATE_NO_HIS.format(
+                num_stages=num_stages,
+                machines_per_stage=machines_per_stage,
+                job_stage_times=job_stage_times,
+            )
+        else:
+            action_mask = td["action_mask"][idx].bool()
+            admissible_indices = [i for i, v in enumerate(action_mask.tolist()) if v]
+            admissible_str = "\n".join(str(i) for i in admissible_indices)
+
+            memory_ctx, valid_lens = self.memory.fetch(
+                self.config.env.history_length,
+                obs_key="text_obs",
+                action_key="action",
+            )
+            action_history = memory_ctx[idx]
+            history_length = valid_lens[idx]
+
+            obs = RL4CO_FFSP_TEMPLATE.format(
+                num_stages=num_stages,
+                machines_per_stage=machines_per_stage,
+                job_stage_times=job_stage_times,
+                current_time=current_time,
+                admissible_actions=admissible_str,
+                history_length=history_length,
+                action_history=action_history,
+            )
+        return obs
+
+    def build_text_obs(self, td, init: bool = False) -> List[str]:
+        postprocess_text_obs: List[str] = []
+        batch_size = td.batch_size[0]
+        env_name = getattr(self.config.env.rl4co_scheduling, "env_name", "jssp").lower()
+
+        for i in range(batch_size):
+            if env_name == "jssp":
+                obs = self._format_jssp_obs_single(td, i, init=init)
+            elif env_name == "ffsp":
+                obs = self._format_ffsp_obs_single(td, i, init=init)
+            else:
+                obs = self._format_jssp_obs_single(td, i, init=init)
+            postprocess_text_obs.append(obs)
+
+        return postprocess_text_obs
+
     def _process_batch(self, batch_idx, total_batch_list, total_infos, success):
         # Find the last entry with active masks
         for i in reversed(range(len(total_batch_list[batch_idx]))):
@@ -128,7 +428,99 @@ class SearchEnvironmentManager(EnvironmentManagerBase):
                 data_source = info.get("data_source")
                 success[f"{data_source}_success_rate"].append(won_value)
                 return  # Exit after finding the first active mask
-            
+
+
+class ML4COKitSchedulingEnvironmentManager(RL4COSchedulingEnvironmentManager):
+    """One-shot manager for ml4co-kit scheduling environments (JSSP/PFSP)."""
+
+    def __init__(self, envs, projection_f, config, env_name: str = "jssp"):
+        self.memory = SimpleMemory()
+        self.ml4co_env_name = env_name.lower()
+        super().__init__(envs, projection_f, config)
+        cfg = getattr(config.env, "ml4co_kit", getattr(config.env, "rl4co_scheduling", SimpleNamespace()))
+        self.sched_env_name = self.ml4co_env_name
+        self.use_format_reward = getattr(cfg, "use_format_reward", self.use_format_reward)
+        self.format_reward_weight = getattr(cfg, "format_reward_weight", self.format_reward_weight)
+        self.feasibility_reward_weight = getattr(cfg, "feasibility_reward_weight", self.feasibility_reward_weight)
+        self.use_conditional_reward = getattr(cfg, "use_conditional_reward", self.use_conditional_reward)
+        self.feasibility_threshold = getattr(cfg, "feasibility_threshold", self.feasibility_threshold)
+        self.normalize_env_reward = getattr(cfg, "normalize_env_reward", self.normalize_env_reward)
+        self.env_reward_range = getattr(cfg, "env_reward_range", self.env_reward_range)
+        self.fixed_scale_reference = getattr(cfg, "fixed_scale_reference", self.fixed_scale_reference)
+        self.pre_text_obs: List[str] = []
+
+    def reset(self, kwargs):
+        observations, infos = super().reset(kwargs)
+        self.pre_text_obs = observations["text"]
+        return observations, infos
+
+    def build_text_obs(self, td, init: bool = False) -> List[str]:
+        """Build text observations using the correct env_name for ML4CO-Kit."""
+        postprocess_text_obs: List[str] = []
+        batch_size = td.batch_size[0]
+        env_name = self.sched_env_name
+
+        for i in range(batch_size):
+            if env_name == "jssp":
+                obs = self._format_jssp_obs_single(td, i, init=init)
+            elif env_name == "pfsp" or env_name == "ffsp":
+                obs = self._format_ffsp_obs_single(td, i, init=init)
+            else:
+                obs = self._format_jssp_obs_single(td, i, init=init)
+            postprocess_text_obs.append(obs)
+
+        return postprocess_text_obs
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        next_td, env_rewards, dones, infos = self.envs.step(actions)
+        env_rewards_np = to_numpy(env_rewards)
+
+        rewards = env_rewards_np
+        format_info: Dict[str, Any] = {}
+        if self.use_format_reward:
+            num_jobs = None
+            if "next_op" in next_td.keys():
+                num_jobs = next_td["next_op"].shape[0]
+            elif "job_location" in next_td.keys():
+                num_jobs = next_td["job_location"].shape[-1] - 1
+            final_rewards, format_info = compute_format_reward(
+                valids=valids,
+                actions=actions,
+                env_rewards=env_rewards_np,
+                env_name=self.sched_env_name,
+                env_type="scheduling",
+                format_reward_weight=self.format_reward_weight,
+                feasibility_reward_weight=self.feasibility_reward_weight,
+                num_jobs=num_jobs,
+                use_conditional_reward=self.use_conditional_reward,
+                feasibility_threshold=self.feasibility_threshold,
+                normalize_env_reward=self.normalize_env_reward,
+                env_reward_range=self.env_reward_range,
+                fixed_scale_reference=self.fixed_scale_reference,
+            )
+            rewards = final_rewards
+
+        final_infos: List[Dict[str, Any]] = []
+        for i, info in enumerate(infos):
+            info_dict = dict(info) if info else {}
+            info_dict["is_action_valid"] = to_numpy(valids[i])
+            if self.use_format_reward:
+                info_dict["format_bonus"] = float(format_info.get("format_bonuses", [0])[i])
+                info_dict["feasibility_bonus"] = float(format_info.get("feasibility_bonuses", [0])[i])
+                info_dict["env_reward"] = float(format_info.get("env_rewards", env_rewards_np)[i])
+                if "format_reward" in format_info:
+                    info_dict["format_reward"] = float(format_info["format_reward"][i])
+                    info_dict["feasibility_reward"] = float(format_info["feasibility_reward"][i])
+                    info_dict["scaled_env_reward"] = float(format_info["env_reward"][i])
+                    info_dict["env_reward_weight"] = float(format_info["env_reward_weight"][i])
+                    info_dict["meets_feasibility_threshold"] = bool(format_info.get("feasibility_mask", [False])[i])
+            final_infos.append(info_dict)
+
+        dones_np = to_numpy(dones) if dones is not None else None
+        next_observations = {"text": self.pre_text_obs, "image": None, "anchor": self.pre_text_obs}
+        return next_observations, rewards, dones_np, final_infos
+
 
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
@@ -541,7 +933,7 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
         self.pre_text_obs = text_obs
 
         full_text_obs = self.build_text_obs(text_obs)
-
+        
         # add action_valid to infos
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
@@ -599,6 +991,321 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
                 postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
+
+class RL4CORoutingEnvironmentManager(EnvironmentManagerBase):
+    """EnvironmentManager for RL4CO routing envs (starting with TSP).
+
+    This manager:
+    - Consumes TensorDict observations produced by `RL4CORoutingEnvs`.
+    - Builds textual prompts describing the current TSP state.
+    - Uses a simple integer-index action interface (see `rl4co_projection`).
+    """
+
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+        self.one_step = False  # RL4CO routing uses step-by-step mode only
+        self.rl4co_env_name = getattr(config.env.rl4co, "env_name", "tsp").lower()
+        # Format reward configuration
+        self.use_format_reward = getattr(config.env.rl4co, "use_format_reward", False)
+        self.format_reward_weight = getattr(config.env.rl4co, "format_reward_weight", 0.05)
+        self.feasibility_reward_weight = getattr(config.env.rl4co, "feasibility_reward_weight", 0.15)
+        # Conditional reward mechanism parameters
+        self.use_conditional_reward = getattr(config.env.rl4co, "use_conditional_reward", True)
+        self.feasibility_threshold = getattr(config.env.rl4co, "feasibility_threshold", 0.9)
+        self.normalize_env_reward = getattr(config.env.rl4co, "normalize_env_reward", True)
+        self.env_reward_range = getattr(config.env.rl4co, "env_reward_range", None)
+        self.fixed_scale_reference = getattr(config.env.rl4co, "fixed_scale_reference", None)
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs) -> Dict[str, Any]:
+        td, infos = self.envs.reset()
+        batch_size = td.batch_size[0] if td.batch_size else len(infos)
+
+        self.memory.reset(batch_size=batch_size)
+        self.pre_text_obs = [""] * batch_size
+
+        text_obs = self.build_text_obs(td, init=True)
+        observations = {"text": text_obs, "image": None, "anchor": text_obs}
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+
+        next_td, env_rewards, dones, infos = self.envs.step(actions)
+
+        # store history based on previous textual observations and actions
+        self.memory.store({"text_obs": self.pre_text_obs, "action": actions})
+
+        text_obs = self.build_text_obs(next_td, init=False)
+        self.pre_text_obs = text_obs
+
+        env_rewards = to_numpy(env_rewards)
+
+        # Compute format reward if enabled (for step-by-step mode)
+        format_bonuses = None
+        if self.use_format_reward:
+            format_bonuses = np.array([1.0 if v == 1 else 0.0 for v in valids], dtype=np.float32)
+            final_rewards = env_rewards + self.format_reward_weight * format_bonuses
+            rewards = final_rewards
+        else:
+            rewards = env_rewards
+
+        for i, info in enumerate(infos):
+            info["is_action_valid"] = to_numpy(valids[i])
+            if self.use_format_reward and format_bonuses is not None:
+                info["format_bonus"] = float(format_bonuses[i])
+                info["env_reward"] = float(env_rewards[i])
+
+        dones = to_numpy(dones) if dones is not None else None
+
+        next_observations = {"text": text_obs, "image": None, "anchor": text_obs}
+        return next_observations, rewards, dones, infos
+
+    def _format_tsp_obs_single(self, td, idx: int, init: bool) -> str:
+        locs = td["locs"][idx]  # (num_nodes, 2)
+
+        num_nodes = locs.shape[-2]
+
+        # Scale coordinates by 1000 and convert to integers for LLM efficiency
+        # Then calculate neighbors based on scaled coordinates
+        k_nn = getattr(self.config.env.rl4co, "k_nn", 2)
+        locs_np = locs.cpu().numpy()
+        # Scale coordinates by 1000 and convert to integers
+        locs_scaled = (locs_np * 1000).astype(int)
+        # Calculate neighbors based on scaled coordinates
+        nns = calculate_top_k_nearest_nodes(locs_scaled.astype(float), k=k_nn)
+
+        # Format city descriptions with neighbors
+        # Format: "Node {i}, coordinates: {instance[i].tolist()}, neighbors: {neighbor_str};"
+        coords_lines = []
+        for city_idx in range(num_nodes):
+            x_scaled, y_scaled = locs_scaled[city_idx].tolist()
+            # Neighbors distances are already calculated based on scaled coordinates
+            neighbor_str = [f"{n[0]}: {int(n[1])}" for n in nns[city_idx]]
+            coords_lines.append(
+                f"Node {city_idx}, coordinates: [{x_scaled}, {y_scaled}], neighbors: {neighbor_str};"
+            )
+        city_coords_with_neighbors = "".join(coords_lines)
+        # Replace last semicolon with period (matching LLMCoSolver)
+        city_coords_with_neighbors = ".".join(city_coords_with_neighbors.rsplit(";", 1))
+
+        obs = RL4CO_TSP_TEMPLATE_NO_HIS.format(
+            num_nodes=num_nodes,
+            k_nn=k_nn,
+            city_coords_with_neighbors=city_coords_with_neighbors,
+        )
+
+        return obs
+
+    def _format_cvrp_obs_single(self, td, idx: int, init: bool) -> str:
+        locs = td["locs"][idx]  # (..., 2)
+        demands = td["demand"][idx]  # may have length num_nodes or num_nodes-1
+        capacity = float(td.get("capacity", td.get("vehicle_capacity"))[idx].item())
+
+        num_nodes = locs.shape[-2]
+        num_customers = num_nodes - 1  # excluding depot
+        demand_len = demands.shape[-1]
+
+        # Scale coordinates by 1000 and convert to integers for LLM efficiency
+        # Then calculate neighbors based on scaled coordinates
+        k_nn = getattr(self.config.env.rl4co, "k_nn", 2)
+        locs_np = locs.cpu().numpy()
+        # Scale coordinates by 1000 and convert to integers
+        locs_scaled = (locs_np * 1000).astype(int)
+        # Calculate neighbors based on scaled coordinates
+        nns = calculate_top_k_nearest_nodes(locs_scaled.astype(float), k=k_nn)
+
+        # Format node descriptions
+        # Format: "Node {i}, coordinates: {instance[i].tolist()}, demand: {int(demands[i])}, neighbors: {neighbor_str};"
+        node_lines = []
+        for node_idx in range(num_nodes):
+            x_scaled, y_scaled = locs_scaled[node_idx].tolist()
+            if node_idx < demand_len:
+                d = int(demands[node_idx].item())
+            else:
+                d = 0
+            # Neighbors distances are already calculated based on scaled coordinates
+            neighbor_str = [f"{n[0]}: {int(n[1])}" for n in nns[node_idx]]
+            node_lines.append(
+                f"Node {node_idx}, coordinates: [{x_scaled}, {y_scaled}], demand: {d}, neighbors: {neighbor_str};"
+            )
+        node_coords_with_neighbors = "".join(node_lines)
+        # Replace last semicolon with period (matching LLMCoSolver)
+        node_coords_with_neighbors = ".".join(node_coords_with_neighbors.rsplit(";", 1))
+
+        obs = RL4CO_CVRP_TEMPLATE_NO_HIS.format(
+            num_customers=num_customers,
+            vehicle_capacity=int(capacity),
+            k_nn=k_nn,
+            node_coords_with_neighbors=node_coords_with_neighbors,
+        )
+
+        return obs
+
+    def _format_op_obs_single(self, td, idx: int, init: bool) -> str:
+        locs = td["locs"][idx]  # (num_nodes, 2)
+        prize = td["prize"][idx]  # (num_nodes,)
+
+        num_nodes = locs.shape[-2]
+        start_node = 0  # default start node
+        if "max_length" in td.keys():
+            max_len_tensor = td["max_length"][idx]
+            max_route_length = float(max_len_tensor.item()) if max_len_tensor.numel() == 1 else 100.0
+        elif "max_route_length" in td.keys():
+            max_len_tensor = td["max_route_length"][idx]
+            max_route_length = float(max_len_tensor.item()) if max_len_tensor.numel() == 1 else 100.0
+        else:
+            max_route_length = 100.0
+
+        # Scale coordinates by 1000 and convert to integers for LLM efficiency
+        # Then calculate neighbors based on scaled coordinates
+        k_nn = getattr(self.config.env.rl4co, "k_nn", 2)
+        locs_np = locs.cpu().numpy()
+        # Scale coordinates by 1000 and convert to integers
+        locs_scaled = (locs_np * 1000).astype(int)
+        # Calculate neighbors based on scaled coordinates
+        nns = calculate_top_k_nearest_nodes(locs_scaled.astype(float), k=k_nn)
+
+        # Format node descriptions
+        # Format: "Node {i}, coordinates: {instance[i].tolist()}, prize: {int(prizes[i])}, neighbors: {neighbor_str};"
+        node_lines = []
+        for node_idx in range(num_nodes):
+            x_scaled, y_scaled = locs_scaled[node_idx].tolist()
+            p = int(prize[node_idx].item())
+            # Neighbors distances are already calculated based on scaled coordinates
+            neighbor_str = [f"{n[0]}: {int(n[1])}" for n in nns[node_idx]]
+            node_lines.append(
+                f"Node {node_idx}, coordinates: [{x_scaled}, {y_scaled}], prize: {p}, neighbors: {neighbor_str};"
+            )
+        node_coords_with_neighbors = "".join(node_lines)
+        # Replace last semicolon with period (matching LLMCoSolver)
+        node_coords_with_neighbors = ".".join(node_coords_with_neighbors.rsplit(";", 1))
+
+        obs = RL4CO_OP_TEMPLATE_NO_HIS.format(
+            num_nodes=num_nodes,
+            start_node=start_node,
+            max_route_length=max_route_length,
+            k_nn=k_nn,
+            node_coords_with_neighbors=node_coords_with_neighbors,
+        )
+
+        return obs
+
+    def build_text_obs(self, td, init: bool = False) -> List[str]:
+        """Build text observations from RL4CO TensorDict."""
+        postprocess_text_obs: List[str] = []
+
+        batch_size = td.batch_size[0]
+        env_name = getattr(self.config.env.rl4co, "env_name", "tsp").lower()
+
+        for i in range(batch_size):
+            if env_name == "tsp":
+                obs = self._format_tsp_obs_single(td, i, init=init)
+            elif env_name == "cvrp":
+                obs = self._format_cvrp_obs_single(td, i, init=init)
+            elif env_name == "op":
+                obs = self._format_op_obs_single(td, i, init=init)
+            else:
+                # Fallback to generic TSP-style description if unknown
+                obs = self._format_tsp_obs_single(td, i, init=init)
+            postprocess_text_obs.append(obs)
+
+        return postprocess_text_obs
+
+
+
+class ML4COKitRoutingEnvironmentManager(RL4CORoutingEnvironmentManager):
+    """One-shot manager for ml4co-kit routing environments."""
+
+    def __init__(self, envs, projection_f, config, env_name: str = "tsp"):
+        self.memory = SimpleMemory()
+        self.ml4co_env_name = env_name.lower()
+        super().__init__(envs, projection_f, config)
+        cfg = getattr(config.env, "ml4co_kit", getattr(config.env, "rl4co", SimpleNamespace()))
+        self.rl4co_env_name = self.ml4co_env_name
+        self.use_format_reward = getattr(cfg, "use_format_reward", self.use_format_reward)
+        self.format_reward_weight = getattr(cfg, "format_reward_weight", self.format_reward_weight)
+        self.feasibility_reward_weight = getattr(cfg, "feasibility_reward_weight", self.feasibility_reward_weight)
+        self.use_conditional_reward = getattr(cfg, "use_conditional_reward", self.use_conditional_reward)
+        self.feasibility_threshold = getattr(cfg, "feasibility_threshold", self.feasibility_threshold)
+        self.normalize_env_reward = getattr(cfg, "normalize_env_reward", self.normalize_env_reward)
+        self.env_reward_range = getattr(cfg, "env_reward_range", self.env_reward_range)
+        self.fixed_scale_reference = getattr(cfg, "fixed_scale_reference", self.fixed_scale_reference)
+        self.pre_text_obs: List[str] = []
+
+    def reset(self, kwargs):
+        observations, infos = super().reset(kwargs)
+        self.pre_text_obs = observations["text"]
+        return observations, infos
+
+    def build_text_obs(self, td, init: bool = False) -> List[str]:
+        """Build text observations using the correct env_name for ML4CO-Kit."""
+        postprocess_text_obs: List[str] = []
+
+        batch_size = td.batch_size[0]
+        env_name = self.rl4co_env_name
+
+        for i in range(batch_size):
+            if env_name == "tsp":
+                obs = self._format_tsp_obs_single(td, i, init=init)
+            elif env_name == "cvrp":
+                obs = self._format_cvrp_obs_single(td, i, init=init)
+            elif env_name == "op":
+                obs = self._format_op_obs_single(td, i, init=init)
+            else:
+                # Fallback to generic TSP-style description if unknown
+                obs = self._format_tsp_obs_single(td, i, init=init)
+            postprocess_text_obs.append(obs)
+
+        return postprocess_text_obs
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+        next_td, env_rewards, dones, infos = self.envs.step(actions)
+        env_rewards_np = to_numpy(env_rewards)
+
+        rewards = env_rewards_np
+        format_info: Dict[str, Any] = {}
+        if self.use_format_reward:
+            num_nodes = next_td["locs"].shape[1] if "locs" in next_td.keys() else None
+            final_rewards, format_info = compute_format_reward(
+                valids=valids,
+                actions=actions,
+                env_rewards=env_rewards_np,
+                env_name=self.rl4co_env_name,
+                env_type="routing",
+                format_reward_weight=self.format_reward_weight,
+                feasibility_reward_weight=self.feasibility_reward_weight,
+                num_nodes=num_nodes,
+                start_node=0,
+                use_conditional_reward=self.use_conditional_reward,
+                feasibility_threshold=self.feasibility_threshold,
+                normalize_env_reward=self.normalize_env_reward,
+                env_reward_range=self.env_reward_range,
+                fixed_scale_reference=self.fixed_scale_reference,
+            )
+            rewards = final_rewards
+
+        final_infos: List[Dict[str, Any]] = []
+        for i, info in enumerate(infos):
+            info_dict = dict(info) if info else {}
+            info_dict["is_action_valid"] = to_numpy(valids[i])
+            if self.use_format_reward:
+                info_dict["format_bonus"] = float(format_info.get("format_bonuses", [0])[i])
+                info_dict["feasibility_bonus"] = float(format_info.get("feasibility_bonuses", [0])[i])
+                info_dict["env_reward"] = float(format_info.get("env_rewards", env_rewards_np)[i])
+                if "format_reward" in format_info:
+                    info_dict["format_reward"] = float(format_info["format_reward"][i])
+                    info_dict["feasibility_reward"] = float(format_info["feasibility_reward"][i])
+                    info_dict["scaled_env_reward"] = float(format_info["env_reward"][i])
+                    info_dict["env_reward_weight"] = float(format_info["env_reward_weight"][i])
+                    info_dict["meets_feasibility_threshold"] = bool(format_info.get("feasibility_mask", [False])[i])
+            final_infos.append(info_dict)
+
+        dones_np = to_numpy(dones) if dones is not None else None
+        next_observations = {"text": self.pre_text_obs, "image": None, "anchor": self.pre_text_obs}
+        return next_observations, rewards, dones_np, final_infos
+
 def make_envs(config):
     """
     Create enviroments 
@@ -607,7 +1314,7 @@ def make_envs(config):
     if not isinstance(config.env.rollout.n, int):
         raise ValueError("config.env.rollout.n should be an integer")
     group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
-    resources_per_worker = OmegaConf.to_container(config.env.resources_per_worker, resolve=True)
+    resources_per_worker = _to_container(config.env.resources_per_worker, resolve=True)
 
     if "search" in config.env.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
@@ -694,6 +1401,353 @@ def make_envs(config):
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
+    elif config.env.env_name.lower().startswith("ml4co-kit/"):
+        from agent_system.environments.env_package.ml4co_kit import (
+            build_ml4cokit_routing_envs,
+            build_ml4cokit_scheduling_envs,
+            ml4cokit_projection,
+            ml4cokit_scheduling_projection,
+        )
+
+        sub_env = config.env.env_name.lower().split("/", 1)[1]
+        if sub_env in ("tsp", "cvrp", "op"):
+            ml4co_cfg = getattr(config.env, "ml4co_kit", getattr(config.env, "rl4co", {}))
+            device = getattr(ml4co_cfg, "device", "cpu")
+            generator_params = _to_container(getattr(ml4co_cfg, "generator_params", {}), resolve=True)
+            rl4co_kwargs = _to_container(getattr(ml4co_cfg, "rl4co_kwargs", {}), resolve=True)
+
+            _envs = build_ml4cokit_routing_envs(
+                env_name=sub_env,
+                seed=config.env.seed,
+                env_num=config.data.train_batch_size,
+                group_n=group_n,
+                device=device,
+                generator_params=generator_params,
+                rl4co_kwargs=rl4co_kwargs,
+            )
+            _val_envs = build_ml4cokit_routing_envs(
+                env_name=sub_env,
+                seed=config.env.seed + 1000,
+                env_num=config.data.val_batch_size,
+                group_n=1,
+                device=device,
+                generator_params=generator_params,
+                rl4co_kwargs=rl4co_kwargs,
+            )
+
+            projection_f = partial(ml4cokit_projection, env_name=sub_env)
+            envs = ML4COKitRoutingEnvironmentManager(_envs, projection_f, config, env_name=sub_env)
+            val_envs = ML4COKitRoutingEnvironmentManager(_val_envs, projection_f, config, env_name=sub_env)
+            return envs, val_envs
+        elif sub_env in ("jssp", "pfsp"):
+            ml4co_cfg = getattr(config.env, "ml4co_kit", getattr(config.env, "rl4co_scheduling", {}))
+            device = getattr(ml4co_cfg, "device", "cpu")
+            generator_params = _to_container(getattr(ml4co_cfg, "generator_params", {}), resolve=True)
+            rl4co_kwargs = _to_container(getattr(ml4co_cfg, "rl4co_kwargs", {}), resolve=True)
+
+            _envs = build_ml4cokit_scheduling_envs(
+                env_name=sub_env,
+                seed=config.env.seed,
+                env_num=config.data.train_batch_size,
+                group_n=group_n,
+                device=device,
+                generator_params=generator_params,
+                rl4co_kwargs=rl4co_kwargs,
+            )
+            _val_envs = build_ml4cokit_scheduling_envs(
+                env_name=sub_env,
+                seed=config.env.seed + 1000,
+                env_num=config.data.val_batch_size,
+                group_n=1,
+                device=device,
+                generator_params=generator_params,
+                rl4co_kwargs=rl4co_kwargs,
+            )
+
+            projection_f = partial(ml4cokit_scheduling_projection, env_name=sub_env)
+            envs = ML4COKitSchedulingEnvironmentManager(_envs, projection_f, config, env_name=sub_env)
+            val_envs = ML4COKitSchedulingEnvironmentManager(_val_envs, projection_f, config, env_name=sub_env)
+            return envs, val_envs
+        else:
+            raise ValueError(f"Unsupported ml4co-kit env: {sub_env}")
+    elif "rl4co_scheduling" in config.env.env_name.lower():
+        from agent_system.environments.env_package.rl4co_scheduling import (
+            build_rl4co_scheduling_envs,
+            rl4co_scheduling_projection,
+        )
+
+        sched_cfg = getattr(config.env, "rl4co_scheduling", {})
+        sched_env_name = getattr(sched_cfg, "env_name", "jssp")
+        sched_device = getattr(sched_cfg, "device", "cpu")
+        generator_params = getattr(sched_cfg, "generator_params", {})
+        rl4co_kwargs = getattr(sched_cfg, "rl4co_kwargs", {})
+        generator_params = _to_container(generator_params, resolve=True)
+        rl4co_kwargs = _to_container(rl4co_kwargs, resolve=True)
+        one_step_sched = False
+
+        _envs = build_rl4co_scheduling_envs(
+            env_name=sched_env_name,
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            device=sched_device,
+            generator_params=generator_params,
+            rl4co_kwargs=rl4co_kwargs,
+        )
+        _val_envs = build_rl4co_scheduling_envs(
+            env_name=sched_env_name,
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            device=sched_device,
+            generator_params=generator_params,
+            rl4co_kwargs=rl4co_kwargs,
+        )
+
+        projection_f = partial(
+            rl4co_scheduling_projection,
+            one_step=one_step_sched,
+            env_name=sched_env_name,
+        )
+        envs = RL4COSchedulingEnvironmentManager(_envs, projection_f, config)
+        val_envs = RL4COSchedulingEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
+    elif "rl4co" in config.env.env_name.lower():
+        from agent_system.environments.env_package.rl4co import (
+            build_rl4co_routing_envs,
+            rl4co_projection,
+        )
+
+        # Resolve rl4co-specific config (with sensible defaults)
+        rl4co_cfg = getattr(config.env, "rl4co", {})
+        rl4co_env_name = getattr(rl4co_cfg, "env_name", "tsp")
+        rl4co_device = getattr(rl4co_cfg, "device", "cpu")
+        one_step_route = False
+
+        generator_params = getattr(rl4co_cfg, "generator_params", {})
+        rl4co_kwargs = getattr(rl4co_cfg, "rl4co_kwargs", {})
+
+        generator_params = _to_container(generator_params, resolve=True)
+        rl4co_kwargs = _to_container(rl4co_kwargs, resolve=True)
+
+        _envs = build_rl4co_routing_envs(
+            env_name=rl4co_env_name,
+            seed=config.env.seed,
+            env_num=config.data.train_batch_size,
+            group_n=group_n,
+            device=rl4co_device,
+            generator_params=generator_params,
+            rl4co_kwargs=rl4co_kwargs,
+        )
+        _val_envs = build_rl4co_routing_envs(
+            env_name=rl4co_env_name,
+            seed=config.env.seed + 1000,
+            env_num=config.data.val_batch_size,
+            group_n=1,
+            device=rl4co_device,
+            generator_params=generator_params,
+            rl4co_kwargs=rl4co_kwargs,
+        )
+
+        projection_f = partial(
+            rl4co_projection,
+            one_step=one_step_route,
+            env_name=rl4co_env_name,
+        )
+        envs = RL4CORoutingEnvironmentManager(_envs, projection_f, config)
+        val_envs = RL4CORoutingEnvironmentManager(_val_envs, projection_f, config)
+        return envs, val_envs
     else:
         print("Environment not supported")
         exit(1)
+
+
+if __name__ == "__main__":
+    """
+    Manual quick-play supporting current backbones:
+    - rl4co/*     : step-by-step routing (tsp/cvrp/op)
+    - ml4co-kit/* : one-shot routing (tsp/cvrp/op)
+    """
+    import time
+    import json
+    from types import SimpleNamespace as NS
+
+    def build_cfg(env_name: str):
+        resources = NS(num_cpus=0.1, num_gpus=0)
+        if env_name.startswith("ml4co-kit/"):
+            sub = env_name.split("/", 1)[1]
+            gen_params = NS(
+                num_loc=10,
+                min_demand=1,
+                max_demand=9,
+                min_capacity=20,
+                max_capacity=20,
+                max_length=3.0,
+            )
+            ml4co = NS(
+                env_name=sub,
+                device="cpu",
+                generator_params=gen_params,
+                rl4co_kwargs=NS(),
+                use_format_reward=True,
+                format_reward_weight=0.05,
+                feasibility_reward_weight=0.15,
+                use_conditional_reward=True,
+                feasibility_threshold=0.9,
+                normalize_env_reward=True,
+                env_reward_range=[-20.0, 0.0],
+                fixed_scale_reference=8.0,
+            )
+            env_cfg = NS(
+                env_name=env_name,
+                seed=0,
+                max_steps=50,
+                history_length=0,
+                rollout=NS(n=1),
+                resources_per_worker=resources,
+                ml4co_kit=ml4co,
+                rl4co=NS(env_name="tsp", device="cpu", generator_params=NS(), rl4co_kwargs=NS()),
+                rl4co_scheduling=NS(env_name="jssp", device="cpu", generator_params=NS(), rl4co_kwargs=NS()),
+            )
+        else:
+            sub = env_name.split("/", 1)[1] if "/" in env_name else env_name
+            rl4co = NS(
+                env_name=sub,
+                device="cpu",
+                generator_params=NS(num_loc=10, min_loc=0.0, max_loc=1.0, min_prize=1.0, max_prize=2.0),
+                rl4co_kwargs=NS(),
+                k_nn=2,
+                one_step=False,
+                use_format_reward=True,
+                format_reward_weight=0.05,
+                feasibility_reward_weight=0.15,
+                use_conditional_reward=True,
+                feasibility_threshold=0.9,
+                normalize_env_reward=True,
+                env_reward_range=[-20.0, 0.0],
+                fixed_scale_reference=8.0,
+            )
+            env_cfg = NS(
+                env_name=f"rl4co/{sub}",
+                seed=0,
+                max_steps=50,
+                history_length=2,
+                rollout=NS(n=1),
+                resources_per_worker=resources,
+                rl4co=rl4co,
+                rl4co_scheduling=NS(env_name="jssp", device="cpu", generator_params=NS(), rl4co_kwargs=NS()),
+            )
+        data_cfg = NS(train_batch_size=1, val_batch_size=1)
+        return NS(env=env_cfg, data=data_cfg)
+
+    env_name = "ml4co-kit/tsp"  # change to rl4co/tsp|cvrp|op or ml4co-kit/*
+    cfg = build_cfg(env_name)
+
+    print(f"[Manual test] env_name = {env_name}")
+    t0 = time.time()
+    envs, _ = make_envs(cfg)
+    print("Init time:", time.time() - t0)
+
+    obs, infos = envs.reset(kwargs={})
+    print("\n" + "=" * 80)
+    print("Initial text observation (first env):")
+    print("=" * 80)
+    print(obs["text"][0])
+    print("=" * 80)
+
+    is_one_shot = env_name.startswith("ml4co-kit/")
+
+    if is_one_shot:
+        sub = env_name.split("/", 1)[1]
+        print("\n[One-shot mode] Provide a complete solution.")
+        if sub in ("tsp", "op"):
+            print('JSON: {"route": [0,3,5,...]}')
+        elif sub == "cvrp":
+            print('JSON: {"routes": [[0,1,2,0],[0,3,4,0]]}')
+
+        user_input = input("\nEnter solution (JSON): ").strip()
+        if not user_input:
+            if sub in ("tsp", "op"):
+                user_input = json.dumps({"route": list(range(5)) + [0]})
+            else:
+                user_input = json.dumps({"routes": [[0, 1, 2, 0]]})
+        text_actions = [user_input]
+
+        obs, rewards, dones, infos = envs.step(text_actions)
+        print("\n" + "=" * 80)
+        print("Results:")
+        print("=" * 80)
+        print(f"Rewards: {rewards}")
+        print(f"Dones: {dones}")
+
+        print("\n" + "-" * 80)
+        print("Reward Breakdown:")
+        print("-" * 80)
+        for i, info in enumerate(infos):
+            env_reward = info.get("env_reward", rewards[i])
+            print(f"\nEnv {i}:")
+            print(f"  Env Reward (original): {env_reward:.4f}")
+            if "format_reward" in info:
+                print(f"  Format Reward: {info.get('format_reward', 0):.4f}")
+                print(f"  Feasibility Reward: {info.get('feasibility_reward', 0):.4f}")
+                print(f"  Scaled Env Reward: {info.get('scaled_env_reward', 0):.4f}")
+                print(f"  Env Reward Weight: {info.get('env_reward_weight', 0):.4f}")
+                print(f"  Final Reward: {rewards[i]:.4f}")
+            elif "format_bonus" in info:
+                print(f"  Format Bonus: {info.get('format_bonus', 0):.4f}")
+                print(f"  Feasibility Bonus: {info.get('feasibility_bonus', 0):.4f}")
+                print(f"  Final Reward: {rewards[i]:.4f}")
+            else:
+                print(f"  Final Reward: {rewards[i]:.4f} (env only)")
+
+        print("\n" + "-" * 80)
+        print("Solution echo:")
+        if "route" in infos[0]:
+            print(f"Route: {infos[0]['route']}")
+        elif "routes" in infos[0]:
+            print(f"Routes: {infos[0].get('routes')}")
+        elif "schedule" in infos[0]:
+            print(f"Schedule: {infos[0].get('schedule')}")
+    else:
+        max_steps = 20
+        for step_idx in range(max_steps):
+            print("\n" + "=" * 80)
+            print(f"Step {step_idx + 1}")
+            print("=" * 80)
+            batch_size = len(obs["text"])
+            print("Current observation (truncated):")
+            print(obs["text"][0][:800] + "..." if len(obs["text"][0]) > 800 else obs["text"][0])
+
+            text_actions = input("\nEnter action(s) (comma-separated): ").strip()
+            if not text_actions:
+                text_actions = "0"
+            acts = [a.strip() for a in text_actions.split(",")]
+            if len(acts) < batch_size:
+                acts.extend([acts[-1]] * (batch_size - len(acts)))
+
+            obs, rewards, dones, infos = envs.step(acts)
+            print(f"\nRewards: {rewards}")
+            print(f"Dones: {dones}")
+
+            if infos:
+                print("\nReward Breakdown:")
+                for i, info in enumerate(infos):
+                    env_reward = info.get("env_reward", rewards[i])
+                    if "format_reward" in info:
+                        print(f"  Env {i}: Format={info.get('format_reward',0):.4f}, "
+                              f"Feasibility={info.get('feasibility_reward',0):.4f}, "
+                              f"Env={info.get('scaled_env_reward',0):.4f}, "
+                              f"Final={rewards[i]:.4f}")
+                    elif "format_bonus" in info:
+                        print(f"  Env {i}: FormatBonus={info.get('format_bonus',0):.4f}, "
+                              f"FeasibilityBonus={info.get('feasibility_bonus',0):.4f}, "
+                              f"Env={env_reward:.4f}, Final={rewards[i]:.4f}")
+                    else:
+                        print(f"  Env {i}: Env={env_reward:.4f}, Final={rewards[i]:.4f}")
+
+            done_flag = dones[0] if isinstance(dones, (list, np.ndarray)) else dones
+            if done_flag:
+                print("\n" + "=" * 80)
+                print("Episode finished!")
+                print("=" * 80)
+                break

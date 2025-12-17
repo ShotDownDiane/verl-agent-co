@@ -314,3 +314,71 @@ env:
   webshop:
     use_small: True
     human_goals: False
+  # RL4CO routing (e.g., TSP / CVRP / OP).
+  # To enable RL4CO step-by-step, set for example:
+  #   env.env_name: rl4co/tsp
+  #   env.rl4co.env_name: tsp
+  # or:
+  #   env.env_name: rl4co/cvrp
+  #   env.rl4co.env_name: cvrp
+  #   env.rl4co.generator_params.num_loc: 21    # 1 depot + 20 customers
+  rl4co:
+    env_name: tsp
+    device: cpu
+    generator_params:
+      # default TSP generator parameters used by RL4CO
+      num_loc: 20
+      min_loc: 0.0
+      max_loc: 1.0
+    rl4co_kwargs: {}
+    # number of nearest neighbors to include in TSP prompt (matching LLMCoSolver, default: 2)
+    k_nn: 2
+    # kept for backward compatibility; RL4CO managers now run step-by-step only
+    one_step: false
+  # RL4CO scheduling (e.g., JSSP / FFSP).
+  # To enable, set for example:
+  #   env.env_name: rl4co_scheduling/jssp
+  #   env.rl4co_scheduling.env_name: jssp
+  # or:
+  #   env.env_name: rl4co_scheduling/ffsp
+  #   env.rl4co_scheduling.env_name: ffsp
+  rl4co_scheduling:
+    env_name: jssp
+    device: cpu
+    generator_params: {}
+    rl4co_kwargs: {}
+    # number of operators with lowest processing time to include in JSSP prompt (matching LLMCoSolver, default: 2)
+    k: 2
+    # kept for backward compatibility; RL4CO scheduling managers run step-by-step only
+    one_step: false
+  # ML4CO-Kit one-shot environments (routing + scheduling).
+  # To enable, set for example:
+  #   env.env_name: ml4co-kit/tsp
+  #   env.ml4co_kit.env_name: tsp
+  # Supported: ml4co-kit/tsp, ml4co-kit/cvrp, ml4co-kit/op, ml4co-kit/jssp, ml4co-kit/pfsp
+  ml4co_kit:
+    env_name: tsp
+    device: cpu
+    generator_params:
+      # Routing defaults (tsp/cvrp/op). Override as needed in run scripts.
+      num_loc: 20
+      min_demand: 1
+      max_demand: 9
+      min_capacity: 20
+      max_capacity: 20
+      max_length: 3.0
+      # Scheduling (jssp/pfsp) can add their specific params via overrides.
+    rl4co_kwargs: {}
+    # routing prompt settings
+    k_nn: 2
+    # scheduling prompt settings
+    k: 2
+    # format reward configuration (conditional reward mechanism)
+    use_format_reward: true
+    format_reward_weight: 0.05
+    feasibility_reward_weight: 0.15
+    use_conditional_reward: true
+    feasibility_threshold: 0.9
+    normalize_env_reward: true
+    env_reward_range: [-20.0, 0.0]
+    fixed_scale_reference: 8.0

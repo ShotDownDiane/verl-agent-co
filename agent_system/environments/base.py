@@ -137,7 +137,14 @@ class EnvironmentManagerBase:
             batch_item = total_batch_list[batch_idx][i]
             if batch_item['active_masks']:
                 info = total_infos[batch_idx][i]
-                won_value = float(info['won'])
+                # Prefer explicit `won` when present; otherwise, for optimization
+                # environments, fall back to feasibility (`is_action_valid`).
+                if 'won' in info:
+                    won_value = float(info['won'])
+                elif 'is_action_valid' in info:
+                    won_value = float(info['is_action_valid'])
+                else:
+                    won_value = 0.0
                 success['success_rate'].append(won_value)
                 return
             
