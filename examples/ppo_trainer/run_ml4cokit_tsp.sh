@@ -1,7 +1,9 @@
 set -x
 ENGINE=${1:-vllm}
-export VLLM_ATTENTION_BACKEND=XFORMERS
+# export VLLM_ATTENTION_BACKEND=XFORMERS
 export HYDRA_FULL_ERROR=1
+export CUDA_LAUNCH_BLOCKING=1
+export NCCL_DEBUG=INFO
 
 # Minimal CPU per env worker; tune down if you need fewer CPU cores.
 num_cpus_per_env_worker=0.1
@@ -10,25 +12,19 @@ num_cpus_per_env_worker=0.1
 train_data_size=4
 val_data_size=4
 
-MODEL_PATH=/share/mas/zhangzhixiang/modellib/Qwen7B_lora_sft
-
-# 设置日志文件路径（包含时间戳）
-LOG_DIR="${HOME}/logs/verl-agent"
-mkdir -p "$LOG_DIR"
-TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-LOG_FILE="${LOG_DIR}/train_${ENGINE}_${TIMESTAMP}.log"
-echo "日志文件: $LOG_FILE"
+# MODEL_PATH=/share/mas/zhangzhixiang/modellib/Qwen7B_lora_sft
+MODEL_PATH=/root/autodl-tmp/Qwen3-8B
+EXPERIMENT_NAME=ppo_qwen3_8b_ml4cokit_tsp #加日期后缀
+TIMESTAMP=$(date +"%Y%m%d_%H%M")
+EXPERIMENT_NAME=${EXPERIMENT_NAME}_${TIMESTAMP}
+PROJECT_NAME=verl_agent_ml4co_kit
 
 # Prepare dummy text data (same modality and sizes as other quick starts).
-python3 -m examples.data_preprocess.prepare \
-    --mode 'text' \
-    --train_data_size $train_data_size \
-    --val_data_size $val_data_size 2>&1 | tee -a "$LOG_FILE"
+# python3 -m examples.data_preprocess.prepare \
+#     --mode 'text' \
+#     --train_data_size $train_data_size \
+#     --val_data_size $val_data_size
 
-# 将标准输出和标准错误都重定向到日志文件
-# 使用 2>&1 将stderr重定向到stdout，然后一起输出到文件
-# 使用 tee 命令可以同时输出到终端和文件
-# 如果只想输出到文件而不显示在终端，可以将 "| tee" 改为 ">>" 或 ">"
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
     data.train_files=$HOME/data/verl-agent/text/train.parquet \
@@ -41,6 +37,7 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='error' \
     data.return_raw_chat=True \
     actor_rollout_ref.model.path=$MODEL_PATH\
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=4 \
@@ -49,28 +46,29 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
-    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
-    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.use_invalid_action_penalty=True \
     actor_rollout_ref.actor.invalid_action_penalty_coef=0.1 \
     critic.optim.lr=1e-5 \
     critic.model.use_remove_padding=True \
     critic.model.path=$MODEL_PATH\
+    critic.model.fsdp_config.model_dtype=bfloat16 \
     critic.model.enable_gradient_checkpointing=True \
-    critic.ppo_micro_batch_size_per_gpu=2 \
-    critic.model.fsdp_config.param_offload=True \
-    critic.model.fsdp_config.optimizer_offload=True \
+    critic.ppo_micro_batch_size_per_gpu=1 \
+    critic.model.fsdp_config.param_offload=False \
+    critic.model.fsdp_config.optimizer_offload=False \
     algorithm.use_kl_in_reward=False \
     env.env_name=ml4co-kit/tsp \
     env.seed=0 \
@@ -94,13 +92,13 @@ python3 -m verl.trainer.main_ppo \
     env.ml4co_kit.env_reward_range=[-20.0,0.0] \
     env.ml4co_kit.fixed_scale_reference=8.0 \
     trainer.critic_warmup=0 \
-    trainer.logger=['console','swanlab'] \
-    trainer.project_name='verl_agent_ml4co_kit' \
-    trainer.experiment_name='ppo_qwen7b_lora_sft_ml4cokit_tsp' \
+    trainer.logger=['console'] \
+    trainer.project_name=$PROJECT_NAME \
+    trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \
     trainer.total_epochs=10 \
-    trainer.val_before_train=True $@ 2>&1 | tee -a "$LOG_FILE"
+    trainer.val_before_train=True $@
 

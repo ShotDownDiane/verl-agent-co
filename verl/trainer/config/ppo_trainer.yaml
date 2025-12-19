@@ -78,6 +78,7 @@ actor_rollout_ref:
       total_training_steps: -1  # must be override by program
       weight_decay: 0.01
     fsdp_config:
+      model_dtype: bfloat16
       wrap_policy:
         # transformer_layer_cls_to_wrap: None
         min_num_params: 0
@@ -89,6 +90,7 @@ actor_rollout_ref:
   ref:
     strategy: fsdp
     fsdp_config:
+      model_dtype: bfloat16
       param_offload: False
       reshard_after_forward: True # only for fsdp2, [True, False, int between 1 and fsdp_size]
       wrap_policy:
@@ -171,6 +173,7 @@ critic:
     use_remove_padding: False
     trust_remote_code: ${actor_rollout_ref.model.trust_remote_code}
     fsdp_config:
+      model_dtype: bfloat16
       param_offload: False
       optimizer_offload: False
       offload_policy: False # only for fsdp2, offload param\grad\optimizer during train

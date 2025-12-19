@@ -1,0 +1,8 @@
+{
+  "task_description": "Design a road network that connects unconnected regions to the existing connected areas in an urban environment. Analyze the provided data to determine which road construction will maximize network connectivity.",
+  "data_schema": "- Connected regions: A list of regions that are already connected.\n- Connectivity: A list of tuples (node_1, node_2, distance) representing existing undirected roads between nodes, where distance is in kilometers.\n- Unconnected regions: A list of regions that are currently isolated from the network.\n- region_nodes: A list of boundary nodes defining the geographical extent of each region.\n- Available roads: A list of potential roads that can be constructed to improve connectivity.\n- road_edge: A tuple (node_1, node_2, distance) representing an undirected road segment available for construction, with the distance specified in kilometers.\n- new_roads: A list of tuples (node_1, node_2, distance) representing additional road segments that may be built following the initial construction.",
+  "domain_knowledge": "- The task is split into two stages.\n- In stage_1, you need to identify the optimal road to construct next that connects the largest number of currently unconnected regions.\n- In stage_2, you need to identify identify the optimal road to construct next minimize travel distances among all regions.\n- Use logical reasoning to determine the best traffic signal activation. DO NOT write any code or algorithms.",
+  "task_target": "determine the most suitable road to build next.",
+  "task_output_type": "decision",
+  "action_space": "- Select the ID of a road segment from the available options as your action.\n"
+}
