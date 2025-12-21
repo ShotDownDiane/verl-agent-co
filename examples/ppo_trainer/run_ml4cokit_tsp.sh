@@ -20,10 +20,10 @@ EXPERIMENT_NAME=${EXPERIMENT_NAME}_${TIMESTAMP}
 PROJECT_NAME=verl_agent_ml4co_kit
 
 # Prepare dummy text data (same modality and sizes as other quick starts).
-# python3 -m examples.data_preprocess.prepare \
-#     --mode 'text' \
-#     --train_data_size $train_data_size \
-#     --val_data_size $val_data_size
+python3 -m examples.data_preprocess.prepare \
+    --mode 'text' \
+    --train_data_size $train_data_size \
+    --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=gae \
@@ -51,7 +51,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -95,7 +95,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.logger=['console'] \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=1 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=5 \

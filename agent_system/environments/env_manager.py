@@ -1021,6 +1021,9 @@ class RL4CORoutingEnvironmentManager(EnvironmentManagerBase):
         td, infos = self.envs.reset()
         batch_size = td.batch_size[0] if td.batch_size else len(infos)
 
+        # Save td for potential use by subclasses (e.g., visualization)
+        self.current_td = td
+
         self.memory.reset(batch_size=batch_size)
         self.pre_text_obs = [""] * batch_size
 
@@ -1232,11 +1235,28 @@ class ML4COKitRoutingEnvironmentManager(RL4CORoutingEnvironmentManager):
         self.env_reward_range = getattr(cfg, "env_reward_range", self.env_reward_range)
         self.fixed_scale_reference = getattr(cfg, "fixed_scale_reference", self.fixed_scale_reference)
         self.pre_text_obs: List[str] = []
+        self.current_td = None  # Store current TensorDict for visualization
 
     def reset(self, kwargs):
+        # Call parent reset (which will save current_td)
         observations, infos = super().reset(kwargs)
         self.pre_text_obs = observations["text"]
+        # current_td is already saved by parent class
         return observations, infos
+    
+    def get_instance_data(self, idx=0):
+        """获取指定索引的原始实例数据"""
+        if hasattr(self, 'current_td') and self.current_td is not None:
+            instance_data = {}
+            if "locs" in self.current_td.keys():
+                instance_data['locs'] = self.current_td['locs'][idx].cpu().numpy()
+            if "demand" in self.current_td.keys():
+                instance_data['demand'] = self.current_td['demand'][idx].cpu().numpy()
+            if "prize" in self.current_td.keys():
+                instance_data['prize'] = self.current_td['prize'][idx].cpu().numpy()
+            instance_data['env_name'] = self.ml4co_env_name
+            return instance_data
+        return None
 
     def build_text_obs(self, td, init: bool = False) -> List[str]:
         """Build text observations using the correct env_name for ML4CO-Kit."""
