@@ -1,0 +1,552 @@
+import ray
+import gymnasium as gym
+
+import random
+import os
+from sympy.simplify.fu import greedy
+import torch
+from torch import Size
+import logging
+import numpy as np
+
+from rl4co.envs.routing.tsp.env import TSPEnv
+from rl4co.envs.routing.cvrp.env import CVRPEnv
+from rl4co.envs.routing.op.env import OPEnv
+
+import matplotlib.pyplot as plt
+from matplotlib.style import available
+from tensordict.tensordict import TensorDict
+from typing import Any, Dict, List, Optional, Tuple
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+
+
+
+def _to_numpy(x: Any):
+    """Utility: convert torch.Tensor to numpy, leave others unchanged."""
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().numpy()
+    return x
+
+class RouteWorker:
+    """Wrapper for RL4CO routing environments (TSP / CVRP / OP).
+
+    Designed to fit verl-agent's env_package style:
+    - Vectorized over env_num * group_n parallel envs.
+    - reset/step API returning (TensorDict, rewards, dones, infos).
+    """
+
+    def __init__(
+        self,
+        env_name: str = "tsp",
+        seed: int = 0,
+        env_num: int = 1,
+        device: str = "cpu",
+        num_loc: int = 10,
+        loc_distribution: str = "uniform",
+        return_topk_options: int = 0,
+        env_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        self.env_name = env_name.lower()
+        self.env_num = env_num
+        self.device = torch.device(device)
+        self.actions: List[int] = []
+        self.return_topk_options = return_topk_options > 0
+        self.topk_k = return_topk_options # default topk_k
+
+        generator_params={
+            "num_loc": num_loc,
+            "loc_distribution": loc_distribution,
+        }
+
+        if self.env_name == "tsp":
+            self.base_env = TSPEnv(
+                generator=None,
+                generator_params=generator_params,
+                seed=seed,
+                device=self.device
+            )
+        elif self.env_name == "cvrp":
+            self.base_env = CVRPEnv(
+                generator=None,
+                generator_params=generator_params,
+                seed=seed,
+                device=self.device
+            )
+        elif self.env_name == "op":
+            self.base_env = OPEnv(
+                generator=None,
+                generator_params=generator_params,
+                seed=seed,
+                device=self.device
+            )
+        else:
+            raise ValueError(f"Unsupported RL4CO routing env: {env_name}")
+
+        self._td: Optional[TensorDict] = None
+
+    def reset(self) -> Tuple[TensorDict, List[Dict[str, Any]]]:
+        """Reset all sub-environments."""
+        self.done = False
+        batch_size = Size([self.env_num])
+        td = self.base_env.reset(batch_size=batch_size)
+        ################# 强制同步
+        for i in range(1,self.env_num):
+            td['locs'][i]=td['locs'][0] 
+        #################
+        self._td = td
+        #如果是topk模式，需要先走第一步            
+        infos = [{}]*self.env_num
+        self.actions=[]
+        if self.return_topk_options:
+            actions = [0]*self.env_num
+            self._td.set("action", torch.tensor(actions, device=self.device))
+            # 计算topk
+            self._td = self.base_env.step(self._td)['next']
+            self.actions.append(actions)
+        obs = self.build_obs(self._td)
+        return obs, infos
+
+    def build_obs(self, td: TensorDict):
+        """Convert TensorDict numeric state into textual observations.
+        
+        Args:
+            td: The current TensorDict state.
+            return_topk_options: If True, appends greedy top-k actions as A/B/C options.
+            topk_k: Number of top actions to show if switch is on.
+
+        Returns a list of string observations, one per batch element.
+        """
+        batch_size = td.batch_size[0] if td.batch_size else 1
+        obs_list: List[str] = []
+
+        # --- Pre-calculate Top-K if needed to avoid overhead inside loop ---
+        topk_data = None
+        if self.return_topk_options and len(self.actions)!=0:
+            # Assumes get_greedy_topk is available as a method or helper function
+            # If it's a standalone function, call it directly:
+            # acts, costs = get_greedy_topk(td, self.env_name, k=topk_k)
+            # Here I assume it's a helper method in the class or global:
+            topk_acts_tensor, topk_costs_tensor = self._get_greedy_topk_helper(td)
+            
+            # Convert to CPU lists for string formatting
+            topk_acts_list = topk_acts_tensor.tolist()
+            topk_costs_list = topk_costs_tensor.tolist()
+            # 存入td
+            td["topk_acts"] = topk_acts_tensor
+            td["topk_costs"] = topk_costs_tensor
+
+        for i in range(batch_size):
+            # TSP / routing common: extract locs and respect optional mask
+            locs = td["locs"][i]
+            
+            # extract first_node and current_node if present
+            first_node = None
+            current_node = None
+            if self.actions != []:
+                fn = _to_numpy(td["first_node"][i])
+                first_node = int(fn) if hasattr(fn, "__int__") else int(fn[0])
+                cn = _to_numpy(td["current_node"][i])
+                current_node = int(cn) if hasattr(cn, "__int__") else int(cn[0])
+            
+            if "locs_mask" in td.keys():
+                mask = td["locs_mask"][i]
+                if mask.numel() > 0:
+                    valid_n = int(mask.sum().item())
+                    locs = locs[:valid_n]
+
+            # Scale coordinates
+            locs_np = _to_numpy(locs)
+            try:
+                locs_scaled = (locs_np * 1000).astype(int)
+            except Exception:
+                locs_scaled = np.array(locs_np, dtype=int)
+
+            # --- Build Metadata ---
+            meta_parts: List[str] = []
+            if first_node is not None:
+                meta_parts.append(f"Start node: {first_node};")
+            else:
+                meta_parts.append("Choose an arbitrary node as the starting node.")
+            if current_node is not None:
+                meta_parts.append(f"Current node: {current_node};")
+            if hasattr(self, "actions") and len(self.actions) > 0:
+                action_str = ",".join(str(action[i]) for action in self.actions) 
+                meta_parts.append(f"Trajectory: {action_str};")
+            meta_prefix = " ".join(meta_parts) + " " if meta_parts else ""
+
+            # --- Build Problem Specific Context ---
+            lines = []
+            if self.env_name == "tsp":
+                for node_idx, (x, y) in enumerate(locs_scaled.tolist()):
+                    lines.append(f"Node {node_idx}, coordinates: [{x}, {y}];")
+                base_info = " ".join(lines) + "\n"
+            
+            elif self.env_name == "cvrp":
+                demands = td.get("demand", None)
+                d_np = _to_numpy(demands[i]) if demands is not None else None
+                
+                cap_tensor = td.get("capacity", td.get("vehicle_capacity", None))
+                capacity = float(_to_numpy(cap_tensor)[0]) if cap_tensor is not None else None
+
+                for node_idx, (x, y) in enumerate(locs_scaled.tolist()):
+                    demand_val = int(d_np[node_idx]) if (d_np is not None and node_idx < len(d_np)) else 0
+                    lines.append(f"Node {node_idx}, coordinates: [{x}, {y}], demand: {demand_val};")
+                cap_str = f" Vehicle capacity: {int(capacity)}." if capacity is not None else ""
+                base_info = " ".join(lines) + cap_str + "\n"
+
+            elif self.env_name == "op":
+                prize = td.get("prize", None)
+                p_np = _to_numpy(prize[i]) if prize is not None else None
+                
+                # Check max length keys
+                max_len_tensor = td.get("max_length", td.get("max_route_length", None))
+                max_route_length = None
+                if max_len_tensor is not None:
+                    try:
+                        max_route_length = float(_to_numpy(max_len_tensor[i]).item())
+                    except:
+                        pass # Handle potential scalar/shape issues
+
+                for node_idx, (x, y) in enumerate(locs_scaled.tolist()):
+                    prize_val = int(p_np[node_idx]) if (p_np is not None and node_idx < len(p_np)) else 0
+                    lines.append(f"Node {node_idx}, coordinates: [{x}, {y}], prize: {prize_val};")
+                max_len_str = f" Max route length: {max_route_length}." if max_route_length is not None else ""
+                base_info = " ".join(lines) + max_len_str + "\n"
+            else:
+                base_info = ""
+
+            obs_str = base_info + meta_prefix
+
+            # --- Append Top-K Options if Switch is ON ---
+            if self.return_topk_options and len(self.actions)!=0:
+                options_str = "\nTop candidates based on distance:\n"
+                opts_labels = ["A", "B", "C", "D", "E", "F", "G", "H"] # Extend if k > 8
+                
+                # Get this batch element's top k
+                b_acts = topk_acts_list[i]
+                b_costs = topk_costs_list[i]
+                
+                valid_opts = []
+                for idx, (act, cost) in enumerate(zip(b_acts, b_costs)):
+                    # Check for inf cost (invalid action masked out)
+                    if cost == float('inf'):
+                        continue
+                    
+                    label = opts_labels[idx] if idx < len(opts_labels) else str(idx+1)
+                    # Format cost nicely (e.g. scaled integer distance or float)
+                    # Using float .3f for clarity
+                    valid_opts.append(f"{label}. Node {act} (Distance: {cost:.3f})")
+                
+                if not valid_opts:
+                    options_str += "No valid moves available."
+                else:
+                    options_str += "; ".join(valid_opts)
+                
+                obs_str += options_str
+
+            obs_list.append(obs_str)
+
+        return obs_list
+
+    def _get_greedy_topk_helper(self, td):
+        """Internal helper to calculate topk. Assumes same logic as previous greedy func."""
+        batch_size = td.batch_size[0] if td.batch_size else 1
+        locs = td["locs"]
+        mask = td["action_mask"]
+        device = locs.device
+        num_loc = locs.shape[1]
+        k = min(self.topk_k, num_loc)
+        
+        curr_node = td.get("current_node", None)
+        dists = torch.full((batch_size, num_loc), float('inf'), device=device)
+
+        is_tsp_start = (self.env_name == 'tsp' and (curr_node is None or curr_node[0] is None))
+        
+        if is_tsp_start:
+            dists = torch.zeros((batch_size, num_loc), device=device)
+        else:
+            curr_indices = curr_node.view(-1, 1, 1).expand(-1, 1, 2)
+            current_pos = locs.gather(1, curr_indices.long())
+            dists = torch.norm(locs - current_pos, p=2, dim=-1)
+
+        inf_tensor = torch.tensor(float('inf'), device=device)
+        dists_masked = torch.where(mask.bool(), dists, inf_tensor)
+        
+        # largest=False for smallest distance
+        topk_costs, topk_actions = torch.topk(dists_masked, self.topk_k, dim=1, largest=False)
+        return topk_actions, topk_costs
+
+    def action_projection(self, env_idx, action):
+        """
+        根据模式将动作投影到合法空间：
+        1. Top-K 选项模式：将 0/1/2 (A/B/C) 映射回真实的 Node ID。
+        2. 原始模式：校验 Node ID 是否被 Mask，若无效则随机采样。
+        """
+        # --- 1. Top-K 选项模式逻辑 ---
+        # 检查是否开启了选项模式 (默认为 False)
+        if self.return_topk_options and len(self.actions)!=0:
+            try:
+                # 获取 Top-K 列表
+                # k 的值应与 build_obs 保持一致，这里默认为 5，或者你可以存在 self.topk_k 中
+                k_val = self.topk_k
+                
+                # 调用之前的 helper 获取候选节点列表 (返回 indices, costs)
+                # 注意：helper 设计时通常接受 batch，这里传入 slice 后的 td 也可以工作
+                # 但为了保险，给 td_slice 增加一个 batch 维度，或者 helper 内部兼容
+                                
+                # topk_candidates shape: (batch, k) -> (k,)
+                candidates = self._td["topk_acts"][env_idx]
+                
+                # 解析动作索引 (例如 0 代表 A)
+                try:
+                    sel_idx = int(action) if not isinstance(action, torch.Tensor) else int(action.item())
+                except Exception:
+                    sel_idx = 0 # 解析失败默认选 A
+
+                # 映射回真实 Node ID
+                if 0 <= sel_idx < len(candidates):
+                    real_action = candidates[sel_idx].item()
+                    
+                    # 【双重保险】检查映射后的节点是否真的有效 (Mask Check)
+                    # 虽然 Top-K 逻辑通常已经过滤了 invalid，但为了防止 k > valid_count 导致选到 inf 节点
+                    mask = self._td.get("action_mask")[env_idx]
+                    if mask[real_action]:
+                        return real_action
+                    else:
+                        print(f"Top-K Option {sel_idx} maps to invalid node {real_action}. Fallback to Top-1.")
+                        return candidates[0].item() # 回退到 Top-1
+                else:
+                    # 如果模型输出了 F (索引 5) 但只有 3 个选项
+                    print(f"Option index {sel_idx} out of bounds (k={len(candidates)}). Fallback to Top-1.")
+                    return candidates[0].item()
+
+            except Exception as e:
+                print(f"Error in Top-K projection: {e}. Fallback to random policy.")
+                # 如果出错，掉落到下方的原始逻辑进行随机采样
+                pass
+
+        # --- 2. 原始逻辑 (直接 Node ID 校验) ---
+        try:
+            if not isinstance(self._td, TensorDict):
+                return action
+            if "action_mask" not in self._td.keys():
+                return action
+
+            mask = self._td.get("action_mask")[env_idx]
+            # mask may be batched: prefer first batch element
+            if isinstance(mask, torch.Tensor):
+                if mask.dim() == 2 and mask.shape[0] >= 1:
+                    mask0 = mask[0]
+                else:
+                    mask0 = mask
+                mask_bool = mask0.bool()
+                
+                # if no available action, return original
+                if mask_bool.sum().item() == 0:
+                    return action
+
+                # convert action to int
+                try:
+                    act_int = int(action) if not isinstance(action, torch.Tensor) else int(action.item())
+                except Exception:
+                    act_int = None
+
+                # 如果动作有效，直接返回
+                if act_int is not None and 0 <= act_int < mask_bool.shape[0] and mask_bool[act_int]:
+                    return action
+
+                # 如果无效，随机采样一个有效的
+                # sample a random available action (uniform over available)
+                idx = torch.multinomial(mask_bool.float(), 1).item()
+                print(f"Invalid action {action}! Using random valid action {idx} replace.")
+                return int(idx)
+        except Exception:
+            # on any error, fall back to original action
+            return action
+        return action
+    
+    def actions_projection(self, actions):
+        projected_actions = []
+        for i,action in enumerate(actions):
+            action = self.action_projection(i,action)
+            projected_actions.append(action)
+        return projected_actions
+
+    def step(self, action) -> Tuple[TensorDict, Any, Any, List[Dict[str, Any]]]:
+        """Step all environments with integer actions."""
+        if self.done == True:
+            obs = ["The enviroment has closed."]*self.env_num
+            rewards = [0]*self.env_num
+            dones = [True]*self.env_num
+            info = [{}]*self.env_num
+            return obs, rewards, dones, info
+        # project action into valid space before applying
+        projected_action = self.actions_projection(action)
+        self.actions.append(projected_action)
+        action_tensor = torch.as_tensor(
+            projected_action, device=self.device, dtype=torch.int64
+        )
+        # self._td中包括action mask，需要进行action projection
+        self._td.set("action", action_tensor)
+        out = self.base_env.step(self._td)
+        next_td = out["next"] if isinstance(out, dict) and "next" in out else out
+        if not isinstance(next_td, TensorDict):
+            raise TypeError(f"Expected TensorDict from step, got {type(next_td)}")
+        self._td = next_td
+
+        rewards = [0]*self.env_num
+        dones = next_td["done"]
+        if dones.all() == True:
+            actions = torch.as_tensor(self.actions, device=self.device, dtype=torch.int64) # step*batch_size
+            actions = actions.transpose(1,0) # batch_size*step
+            rewards = self.base_env.get_reward(self._td, actions)
+            self.done=True
+        infos = [{}]*self.env_num # placeholder
+        obs = self.build_obs(self._td)   
+        return obs, rewards, dones, infos
+    
+
+class RouteEnvs(gym.Env):
+    def __init__(self, env_name, seed, env_num, group_n, device, resources_per_worker, is_train=True, return_topk_options=True,env_kwargs=None):
+        super().__init__()
+
+        self.env_name = env_name
+        self.num_processes = env_num*group_n
+        self.env_num=env_num
+        self.group_n = group_n
+        self.return_topk_options = return_topk_options
+
+        # Ensure Ray is initialized
+        if not ray.is_initialized():
+            ray.init()
+
+        # Extract generator params if provided
+        generator_params = env_kwargs.get("generator_params", {}) if isinstance(env_kwargs, dict) else {}
+        num_loc = generator_params.get("num_loc", 10)
+        loc_distribution = generator_params.get("loc_distribution", "uniform")
+        if not isinstance(num_loc,list):
+            num_loc = [num_loc]*self.env_num
+        if not isinstance(loc_distribution,list):
+            loc_distribution=[loc_distribution]*self.env_num
+
+        # Create Ray remote actors. If resources_per_worker is empty, call ray.remote(RouteWorker)
+        if resources_per_worker:
+            env_worker = ray.remote(**resources_per_worker)(RouteWorker)
+        else:
+            env_worker = ray.remote(RouteWorker)
+        self.workers = []
+        # Create one worker per group and replicate it `group_n` times so that
+        # instances within the same group are identical (share the same actor).
+        for g in range(env_num):
+            worker = env_worker.remote(env_name, seed + g, self.group_n, device, num_loc[g], loc_distribution[g], return_topk_options,env_kwargs)
+            self.workers.append(worker)
+
+    def step(self, actions):
+        assert len(actions) == self.num_processes, "The num of actions must be equal to the num of processes"
+
+        # action首先需要按照group划分成env_num*group_num
+        actions = np.array(actions)
+        actions = actions.reshape((self.env_num,self.group_n))
+        # Send step commands to all workers
+        futures = [worker.step.remote(actions[i]) for i, worker in enumerate(self.workers)]
+        results = ray.get(futures) # env_num,4,group_n
+
+        text_obs_list = []
+        rewards_list = []
+        dones_list = []
+        info_list = []
+
+        for i in range(self.env_num):
+            for j in range(self.group_n):
+                text_obs_list.append(results[i][0][j])
+                rewards_list.append(results[i][1][j])
+                dones_list.append(results[i][2][j])
+                info_list.append(results[i][3][j])
+
+        return text_obs_list, rewards_list, dones_list, info_list
+
+    def reset(self):
+        futures = [worker.reset.remote() for worker in self.workers]
+        results = ray.get(futures) # env_num*2*group_num
+        text_obs_list=[]
+        info_list = []
+        self.has_done=[False]*self.num_processes
+        for i in range(self.env_num):
+            for j in range(self.group_n):
+                text_obs_list.append(results[i][0][j])
+                info_list.append(results[i][1][j])
+
+        return text_obs_list, info_list
+
+    def close(self):
+        for worker in self.workers:
+            try:
+                ray.kill(worker)
+            except Exception:
+                pass
+
+
+def build_route_envs(
+    env_name: str = "tsp",
+    seed: int = 0,
+    env_num: int = 1,
+    group_n: int = 3,
+    device: str = "cpu",
+    generator_params: Optional[Dict[str, Any]] = None,
+    rl4co_kwargs: Optional[Dict[str, Any]] = None,
+    return_topk_options: int = 0
+):
+    # Package generator / rl4co kwargs into env_kwargs for RouteEnvs.
+    env_kwargs: Dict[str, Any] = {}
+    if generator_params is not None:
+        env_kwargs["generator_params"] = generator_params
+    if rl4co_kwargs is not None:
+        env_kwargs["rl4co_kwargs"] = rl4co_kwargs
+
+    # resources_per_worker is optional here; use empty dict so RouteEnvs will
+    # create actors with default resources unless the caller extends this builder.
+    resources_per_worker: Dict[str, Any] = {}
+
+    return RouteEnvs(
+        env_name=env_name,
+        seed=seed,
+        env_num=env_num,
+        group_n=group_n,
+        device=device,
+        resources_per_worker=resources_per_worker,
+        is_train=True,
+        return_topk_options=return_topk_options,
+        env_kwargs=env_kwargs,
+    )
+
+if __name__ == "__main__":
+    # Simple smoke test for RouteEnvs
+    print("Running simple smoke test for RouteEnvs...")
+    try:
+        env = build_route_envs(
+            env_name="tsp",
+            seed=0,
+            env_num=1,
+            group_n=1,
+            device="cpu",
+            generator_params={"num_loc": 10},
+            rl4co_kwargs={},
+            return_topk_options=0,
+        )
+        obs, infos = env.reset()
+        print("Reset text obs (first):", obs)
+
+        actions = [1]  # choose node 0 as a simple action for single-process env
+        obs2, rewards, dones, infos2 = env.step(actions)
+        print(obs2)
+        actions = [2]
+        obs3, rewards, dones, infos3 = env.step(actions)
+        print(obs3)
+        
+    except Exception as e:
+        print("Smoke test failed with exception:", e)
+    finally:
+        try:
+            env.close()
+        except Exception:
+            pass

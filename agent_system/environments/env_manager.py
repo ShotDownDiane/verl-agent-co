@@ -999,7 +999,7 @@ class RouteEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         self.rl4co_env_name = getattr(config.env.rl4co, "env_name", "tsp").lower() if hasattr(config, "env") and getattr(config.env, "rl4co", None) else "tsp"
-
+        self.return_topk_options = config.return_topk_options
         # Format reward configuration (optional)
         rl4co_cfg = getattr(config.env, "rl4co", {}) if hasattr(config, "env") else {}
         self.use_format_reward = getattr(rl4co_cfg, "use_format_reward", True)
@@ -1091,14 +1091,14 @@ class RouteEnvironmentManager(EnvironmentManagerBase):
     
     def build_text_obs(self, text_obs) -> List[str]:
         postprocess_text_obs = []
+        Template = RL4CO_TSP_TEMPLATE if self.return_topk_options else RL4CO_TSP_TEMPLATE_NO_HIS
         for i in range(len(text_obs)):
-            obs = RL4CO_TSP_TEMPLATE_NO_HIS.format(
+            obs = Template.format(
                     text_obs = text_obs[i]
                 )
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
         
-
 
 def make_envs(config):
     """
@@ -1270,6 +1270,7 @@ def make_envs(config):
         sched_device = config.device
         generator_params = config.generator_params
         rl4co_kwargs = config.rl4co_kwargs
+        return_topk_options = config.return_topk_options
 
         _envs = build_rl4co_scheduling_envs(
             env_name=sched_env_name,
@@ -1279,6 +1280,7 @@ def make_envs(config):
             device=sched_device,
             generator_params=generator_params,
             rl4co_kwargs=rl4co_kwargs,
+            return_topk_options=return_topk_options,
         )
         _val_envs = build_rl4co_scheduling_envs(
             env_name=sched_env_name,
@@ -1288,6 +1290,7 @@ def make_envs(config):
             device=sched_device,
             generator_params=generator_params,
             rl4co_kwargs=rl4co_kwargs,
+            return_topk_options=return_topk_options,
         )
 
         projection_f = partial(
@@ -1301,14 +1304,16 @@ def make_envs(config):
         from agent_system.environments.env_package.rl4co import (
             build_route_envs,
             route_projection,
+            route_projection_selected,
         )
 
         # Resolve rl4co-specific config (with sensible defaults)
         rl4co_env_name = config.env_name.split("/")[1]
         rl4co_device = config.device
         env_nums = config.train_batch_size
+        return_topk_options = config.return_topk_options
 
-        num_locs = np.random.randint(20,100, env_nums).tolist()
+        num_locs = np.random.randint(20,40, env_nums).tolist()
 
         generator_params = SimpleNamespace(
             num_loc=num_locs, 
@@ -1325,7 +1330,8 @@ def make_envs(config):
             env_num=config.train_batch_size,
             group_n=group_n,
             device=rl4co_device,
-            generator_params=generator_params
+            generator_params=generator_params,
+            return_topk_options=return_topk_options,
         )
         _val_envs = build_route_envs(
             env_name=rl4co_env_name,
@@ -1333,13 +1339,19 @@ def make_envs(config):
             env_num=config.val_batch_size,
             group_n=1,
             device=rl4co_device,
-            generator_params=generator_params
+            generator_params=generator_params,
+            return_topk_options=return_topk_options,
         )
-
-        projection_f = partial(
-            route_projection,
-            env_name=rl4co_env_name,
-        )
+        if return_topk_options > 0:
+            projection_f = partial(
+                route_projection_selected,
+                env_name=rl4co_env_name,
+            )
+        else:
+            projection_f = partial(
+                route_projection,
+                env_name=rl4co_env_name,
+            )
         envs = RouteEnvironmentManager(_envs, projection_f, config)
         val_envs = RouteEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
@@ -1364,7 +1376,8 @@ if __name__ == "__main__":
         "env_name": env_name,
         "seed": 0,
         "group_n": 3,
-        "device":"cpu"
+        "device":"cpu",
+        "return_topk_options": 3,
     }
     cfg = OmegaConf.create(cfg)
     print(f"[Manual test] env_name = {env_name}")

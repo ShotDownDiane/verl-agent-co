@@ -11,13 +11,17 @@ Solve the problem efficiently and clearly. Think step-by-step before answering. 
 
 
 RL4CO_TSP_TEMPLATE = """
-Solve the Traveling Salesman Problem (TSP) for the given list of {num_nodes} cities. Each city is represented as a node with coordinates (x, y). Identify the shortest route that visits every city exactly once and returns to the starting city. The input includes city coordinates, the {k_nn} nearest neighbors for each city, and their respective distances. Provide the solution in the following format:
+The task is to identify the shortest route that visits every city exactly once and returns to the starting city. 
 
-1. Route: List the nodes in the order they are visited.
-2. Objective: The objective value (total travel distance).
+Each city is represented as a node with $(x, y)$ coordinates. The input provides the city coordinates, the current trajectory, and a list of **Top-K candidate neighbors** (e.g., Option A, B, C...) based on distance.
+
+Based on the provided data and candidates, determine the most logical next city to visit to minimize the total travel distance while respecting the TSP constraints.
 
 Input:
-{city_coords_with_neighbors}
+{text_obs}
+
+Which option is the best next step? 
+Response strictly in the format: "Therefore, the final answer is: \\boxed{{OPTION_LETTER}}".
 """
 
 

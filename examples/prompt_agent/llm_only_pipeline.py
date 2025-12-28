@@ -71,7 +71,8 @@ if __name__ == "__main__":
         "env_name": "rl4co/tsp",
         "seed": 0,
         "group_n": 1,
-        "device":"cpu"
+        "device":"cpu",
+        "return_topk_options": 5,
     }
     cfg = OmegaConf.create(cfg)
 
