@@ -234,7 +234,6 @@ class RL4COSchedulingEnvironmentManager(EnvironmentManagerBase):
 
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
-        self.one_step = False  # RL4CO scheduling uses step-by-step mode only
         self.sched_env_name = getattr(
             config.env.rl4co_scheduling, "env_name", "jssp"
         ).lower()
@@ -263,6 +262,8 @@ class RL4COSchedulingEnvironmentManager(EnvironmentManagerBase):
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
         next_td, env_rewards, dones, infos = self.envs.step(actions)
+        # update stored TensorDict so external agents can inspect latest instance
+        self.current_td = next_td
 
         self.memory.store({"text_obs": self.pre_text_obs, "action": actions})
         text_obs = self.build_text_obs(next_td, init=False)
@@ -758,18 +759,18 @@ class GymCardEnvironmentManager(EnvironmentManagerBase):
         """
         postprocess_text_obs = []
         for i in range(len(infos)):
-            if 'ezpoints' in self.config.env.env_name.lower():
+            if 'ezpoints' in self.config.env_name.lower():
                 text_formula = ''.join(str(element) for element in infos[i]['Formula']) if infos[i] is not None else ''
                 obs = GYM_CARDS_EZPOINTS_TEMPLATE.format(text_formula=text_formula)
-            elif 'points24' in self.config.env.env_name.lower():
+            elif 'points24' in self.config.env_name.lower():
                 text_formula = ''.join(str(element) for element in infos[i]['Formula']) if infos[i] is not None else ''
                 obs = GYM_CARDS_POINTS24_TEMPLATE.format(text_formula=text_formula)
-            elif 'numberline' in self.config.env.env_name.lower():
+            elif 'numberline' in self.config.env_name.lower():
                 obs = GYM_CARDS_NUMBERLINE_TEMPLATE
-            elif "blackjack" in self.config.env.env_name.lower():
+            elif "blackjack" in self.config.env_name.lower():
                 obs = GYM_CARDS_BLACKJACK_TEMPLATE
             else:
-                raise ValueError(f"Unsupported environment: {self.config.env.env_name}")
+                raise ValueError(f"Unsupported environment: {self.config.env_name}")
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
 
@@ -992,59 +993,79 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
         return postprocess_text_obs
 
 
-class RL4CORoutingEnvironmentManager(EnvironmentManagerBase):
+class RouteEnvironmentManager(EnvironmentManagerBase):
     """EnvironmentManager for RL4CO routing envs (starting with TSP).
-
-    This manager:
-    - Consumes TensorDict observations produced by `RL4CORoutingEnvs`.
-    - Builds textual prompts describing the current TSP state.
-    - Uses a simple integer-index action interface (see `rl4co_projection`).
     """
-
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
-        self.one_step = False  # RL4CO routing uses step-by-step mode only
-        self.rl4co_env_name = getattr(config.env.rl4co, "env_name", "tsp").lower()
-        # Format reward configuration
-        self.use_format_reward = getattr(config.env.rl4co, "use_format_reward", False)
-        self.format_reward_weight = getattr(config.env.rl4co, "format_reward_weight", 0.05)
-        self.feasibility_reward_weight = getattr(config.env.rl4co, "feasibility_reward_weight", 0.15)
-        # Conditional reward mechanism parameters
-        self.use_conditional_reward = getattr(config.env.rl4co, "use_conditional_reward", True)
-        self.feasibility_threshold = getattr(config.env.rl4co, "feasibility_threshold", 0.9)
-        self.normalize_env_reward = getattr(config.env.rl4co, "normalize_env_reward", True)
-        self.env_reward_range = getattr(config.env.rl4co, "env_reward_range", None)
-        self.fixed_scale_reference = getattr(config.env.rl4co, "fixed_scale_reference", None)
+        self.rl4co_env_name = getattr(config.env.rl4co, "env_name", "tsp").lower() if hasattr(config, "env") and getattr(config.env, "rl4co", None) else "tsp"
+        self.return_topk_options = config.return_topk_options
+        # Format reward configuration (optional)
+        rl4co_cfg = getattr(config.env, "rl4co", {}) if hasattr(config, "env") else {}
+        self.use_format_reward = getattr(rl4co_cfg, "use_format_reward", True)
+        self.format_reward_weight = getattr(rl4co_cfg, "format_reward_weight", 0.05)
+        self.feasibility_reward_weight = getattr(rl4co_cfg, "feasibility_reward_weight", 0.15)
+        self.use_conditional_reward = getattr(rl4co_cfg, "use_conditional_reward", True)
+        self.feasibility_threshold = getattr(rl4co_cfg, "feasibility_threshold", 0.9)
+        self.normalize_env_reward = getattr(rl4co_cfg, "normalize_env_reward", True)
+        self.env_reward_range = getattr(rl4co_cfg, "env_reward_range", None)
+        self.fixed_scale_reference = getattr(rl4co_cfg, "fixed_scale_reference", None)
+
         super().__init__(envs, projection_f, config)
 
-    def reset(self, kwargs) -> Dict[str, Any]:
-        td, infos = self.envs.reset()
-        batch_size = td.batch_size[0] if td.batch_size else len(infos)
+    def reset(self, kwargs=None) -> Dict[str, Any]:
+        # Some env implementations accept kwargs, others do not.
+        try:
+            res = self.envs.reset(kwargs=kwargs) if kwargs is not None else self.envs.reset()
+        except TypeError:
+            res = self.envs.reset()
 
-        # Save td for potential use by subclasses (e.g., visualization)
-        self.current_td = td
+        # Accept different return signatures:
+        # (text_obs_list, image_obs_list, infos) or (text_obs_list, infos)
+        if isinstance(res, tuple) and len(res) == 3:
+            text_obs_list, image_obs_list, infos = res
+        elif isinstance(res, tuple) and len(res) == 2:
+            text_obs_list, infos = res
+            image_obs_list = None
+        else:
+            # Fallback: treat whole as text_obs
+            text_obs_list = res
+            image_obs_list = None
+            infos = [{} for _ in range(len(text_obs_list) if hasattr(text_obs_list, "__len__") else 1)]
 
+        batch_size = len(text_obs_list) if hasattr(text_obs_list, "__len__") else 1
         self.memory.reset(batch_size=batch_size)
         self.pre_text_obs = [""] * batch_size
 
-        text_obs = self.build_text_obs(td, init=True)
-        observations = {"text": text_obs, "image": None, "anchor": text_obs}
+        text_obs_list = self.build_text_obs(text_obs_list)
+        observations = {"text": text_obs_list, "image": image_obs_list, "anchor": text_obs_list}
         return observations, infos
 
     def step(self, text_actions: List[str]):
         actions, valids = self.projection_f(text_actions)
 
-        next_td, env_rewards, dones, infos = self.envs.step(actions)
+        res = self.envs.step(actions)
 
-        # store history based on previous textual observations and actions
+        # Accept multiple possible signatures:
+        # (text_obs_list, image_obs_list, rewards, dones, infos)
+        # (text_obs_list, rewards, dones, infos)
+        if isinstance(res, tuple) and len(res) == 5:
+            next_text_obs, image_obs_list, env_rewards, dones, infos = res
+        elif isinstance(res, tuple) and len(res) == 4:
+            next_text_obs, env_rewards, dones, infos = res
+            image_obs_list = None
+        else:
+            # Unexpected shape
+            raise ValueError("Unexpected return shape from routing envs.step")
+
+        # Store history and update textual observations
         self.memory.store({"text_obs": self.pre_text_obs, "action": actions})
-
-        text_obs = self.build_text_obs(next_td, init=False)
+        text_obs = next_text_obs
         self.pre_text_obs = text_obs
 
         env_rewards = to_numpy(env_rewards)
 
-        # Compute format reward if enabled (for step-by-step mode)
+        # Compute format reward if enabled
         format_bonuses = None
         if self.use_format_reward:
             format_bonuses = np.array([1.0 if v == 1 else 0.0 for v in valids], dtype=np.float32)
@@ -1053,290 +1074,38 @@ class RL4CORoutingEnvironmentManager(EnvironmentManagerBase):
         else:
             rewards = env_rewards
 
+        # Enrich infos
         for i, info in enumerate(infos):
+            if info is None:
+                infos[i] = {}
+                info = infos[i]
             info["is_action_valid"] = to_numpy(valids[i])
             if self.use_format_reward and format_bonuses is not None:
                 info["format_bonus"] = float(format_bonuses[i])
                 info["env_reward"] = float(env_rewards[i])
 
         dones = to_numpy(dones) if dones is not None else None
-
-        next_observations = {"text": text_obs, "image": None, "anchor": text_obs}
+        text_obs = self.build_text_obs(text_obs)
+        next_observations = {"text": text_obs, "image": image_obs_list, "anchor": text_obs}
         return next_observations, rewards, dones, infos
-
-    def _format_tsp_obs_single(self, td, idx: int, init: bool) -> str:
-        locs = td["locs"][idx]  # (num_nodes, 2)
-
-        num_nodes = locs.shape[-2]
-
-        # Scale coordinates by 1000 and convert to integers for LLM efficiency
-        # Then calculate neighbors based on scaled coordinates
-        k_nn = getattr(self.config.env.rl4co, "k_nn", 2)
-        locs_np = locs.cpu().numpy()
-        # Scale coordinates by 1000 and convert to integers
-        locs_scaled = (locs_np * 1000).astype(int)
-        # Calculate neighbors based on scaled coordinates
-        nns = calculate_top_k_nearest_nodes(locs_scaled.astype(float), k=k_nn)
-
-        # Format city descriptions with neighbors
-        # Format: "Node {i}, coordinates: {instance[i].tolist()}, neighbors: {neighbor_str};"
-        coords_lines = []
-        for city_idx in range(num_nodes):
-            x_scaled, y_scaled = locs_scaled[city_idx].tolist()
-            # Neighbors distances are already calculated based on scaled coordinates
-            neighbor_str = [f"{n[0]}: {int(n[1])}" for n in nns[city_idx]]
-            coords_lines.append(
-                f"Node {city_idx}, coordinates: [{x_scaled}, {y_scaled}], neighbors: {neighbor_str};"
-            )
-        city_coords_with_neighbors = "".join(coords_lines)
-        # Replace last semicolon with period (matching LLMCoSolver)
-        city_coords_with_neighbors = ".".join(city_coords_with_neighbors.rsplit(";", 1))
-
-        obs = RL4CO_TSP_TEMPLATE_NO_HIS.format(
-            num_nodes=num_nodes,
-            k_nn=k_nn,
-            city_coords_with_neighbors=city_coords_with_neighbors,
-        )
-
-        return obs
-
-    def _format_cvrp_obs_single(self, td, idx: int, init: bool) -> str:
-        locs = td["locs"][idx]  # (..., 2)
-        demands = td["demand"][idx]  # may have length num_nodes or num_nodes-1
-        capacity = float(td.get("capacity", td.get("vehicle_capacity"))[idx].item())
-
-        num_nodes = locs.shape[-2]
-        num_customers = num_nodes - 1  # excluding depot
-        demand_len = demands.shape[-1]
-
-        # Scale coordinates by 1000 and convert to integers for LLM efficiency
-        # Then calculate neighbors based on scaled coordinates
-        k_nn = getattr(self.config.env.rl4co, "k_nn", 2)
-        locs_np = locs.cpu().numpy()
-        # Scale coordinates by 1000 and convert to integers
-        locs_scaled = (locs_np * 1000).astype(int)
-        # Calculate neighbors based on scaled coordinates
-        nns = calculate_top_k_nearest_nodes(locs_scaled.astype(float), k=k_nn)
-
-        # Format node descriptions
-        # Format: "Node {i}, coordinates: {instance[i].tolist()}, demand: {int(demands[i])}, neighbors: {neighbor_str};"
-        node_lines = []
-        for node_idx in range(num_nodes):
-            x_scaled, y_scaled = locs_scaled[node_idx].tolist()
-            if node_idx < demand_len:
-                d = int(demands[node_idx].item())
-            else:
-                d = 0
-            # Neighbors distances are already calculated based on scaled coordinates
-            neighbor_str = [f"{n[0]}: {int(n[1])}" for n in nns[node_idx]]
-            node_lines.append(
-                f"Node {node_idx}, coordinates: [{x_scaled}, {y_scaled}], demand: {d}, neighbors: {neighbor_str};"
-            )
-        node_coords_with_neighbors = "".join(node_lines)
-        # Replace last semicolon with period (matching LLMCoSolver)
-        node_coords_with_neighbors = ".".join(node_coords_with_neighbors.rsplit(";", 1))
-
-        obs = RL4CO_CVRP_TEMPLATE_NO_HIS.format(
-            num_customers=num_customers,
-            vehicle_capacity=int(capacity),
-            k_nn=k_nn,
-            node_coords_with_neighbors=node_coords_with_neighbors,
-        )
-
-        return obs
-
-    def _format_op_obs_single(self, td, idx: int, init: bool) -> str:
-        locs = td["locs"][idx]  # (num_nodes, 2)
-        prize = td["prize"][idx]  # (num_nodes,)
-
-        num_nodes = locs.shape[-2]
-        start_node = 0  # default start node
-        if "max_length" in td.keys():
-            max_len_tensor = td["max_length"][idx]
-            max_route_length = float(max_len_tensor.item()) if max_len_tensor.numel() == 1 else 100.0
-        elif "max_route_length" in td.keys():
-            max_len_tensor = td["max_route_length"][idx]
-            max_route_length = float(max_len_tensor.item()) if max_len_tensor.numel() == 1 else 100.0
-        else:
-            max_route_length = 100.0
-
-        # Scale coordinates by 1000 and convert to integers for LLM efficiency
-        # Then calculate neighbors based on scaled coordinates
-        k_nn = getattr(self.config.env.rl4co, "k_nn", 2)
-        locs_np = locs.cpu().numpy()
-        # Scale coordinates by 1000 and convert to integers
-        locs_scaled = (locs_np * 1000).astype(int)
-        # Calculate neighbors based on scaled coordinates
-        nns = calculate_top_k_nearest_nodes(locs_scaled.astype(float), k=k_nn)
-
-        # Format node descriptions
-        # Format: "Node {i}, coordinates: {instance[i].tolist()}, prize: {int(prizes[i])}, neighbors: {neighbor_str};"
-        node_lines = []
-        for node_idx in range(num_nodes):
-            x_scaled, y_scaled = locs_scaled[node_idx].tolist()
-            p = int(prize[node_idx].item())
-            # Neighbors distances are already calculated based on scaled coordinates
-            neighbor_str = [f"{n[0]}: {int(n[1])}" for n in nns[node_idx]]
-            node_lines.append(
-                f"Node {node_idx}, coordinates: [{x_scaled}, {y_scaled}], prize: {p}, neighbors: {neighbor_str};"
-            )
-        node_coords_with_neighbors = "".join(node_lines)
-        # Replace last semicolon with period (matching LLMCoSolver)
-        node_coords_with_neighbors = ".".join(node_coords_with_neighbors.rsplit(";", 1))
-
-        obs = RL4CO_OP_TEMPLATE_NO_HIS.format(
-            num_nodes=num_nodes,
-            start_node=start_node,
-            max_route_length=max_route_length,
-            k_nn=k_nn,
-            node_coords_with_neighbors=node_coords_with_neighbors,
-        )
-
-        return obs
-
-    def build_text_obs(self, td, init: bool = False) -> List[str]:
-        """Build text observations from RL4CO TensorDict."""
-        postprocess_text_obs: List[str] = []
-
-        batch_size = td.batch_size[0]
-        env_name = getattr(self.config.env.rl4co, "env_name", "tsp").lower()
-
-        for i in range(batch_size):
-            if env_name == "tsp":
-                obs = self._format_tsp_obs_single(td, i, init=init)
-            elif env_name == "cvrp":
-                obs = self._format_cvrp_obs_single(td, i, init=init)
-            elif env_name == "op":
-                obs = self._format_op_obs_single(td, i, init=init)
-            else:
-                # Fallback to generic TSP-style description if unknown
-                obs = self._format_tsp_obs_single(td, i, init=init)
-            postprocess_text_obs.append(obs)
-
-        return postprocess_text_obs
-
-
-
-class ML4COKitRoutingEnvironmentManager(RL4CORoutingEnvironmentManager):
-    """One-shot manager for ml4co-kit routing environments."""
-
-    def __init__(self, envs, projection_f, config, env_name: str = "tsp"):
-        self.memory = SimpleMemory()
-        self.ml4co_env_name = env_name.lower()
-        super().__init__(envs, projection_f, config)
-        cfg = getattr(config.env, "ml4co_kit", getattr(config.env, "rl4co", SimpleNamespace()))
-        self.rl4co_env_name = self.ml4co_env_name
-        self.use_format_reward = getattr(cfg, "use_format_reward", self.use_format_reward)
-        self.format_reward_weight = getattr(cfg, "format_reward_weight", self.format_reward_weight)
-        self.feasibility_reward_weight = getattr(cfg, "feasibility_reward_weight", self.feasibility_reward_weight)
-        self.use_conditional_reward = getattr(cfg, "use_conditional_reward", self.use_conditional_reward)
-        self.feasibility_threshold = getattr(cfg, "feasibility_threshold", self.feasibility_threshold)
-        self.normalize_env_reward = getattr(cfg, "normalize_env_reward", self.normalize_env_reward)
-        self.env_reward_range = getattr(cfg, "env_reward_range", self.env_reward_range)
-        self.fixed_scale_reference = getattr(cfg, "fixed_scale_reference", self.fixed_scale_reference)
-        self.pre_text_obs: List[str] = []
-        self.current_td = None  # Store current TensorDict for visualization
-
-    def reset(self, kwargs):
-        # Call parent reset (which will save current_td)
-        observations, infos = super().reset(kwargs)
-        self.pre_text_obs = observations["text"]
-        # current_td is already saved by parent class
-        return observations, infos
     
-    def get_instance_data(self, idx=0):
-        """获取指定索引的原始实例数据"""
-        if hasattr(self, 'current_td') and self.current_td is not None:
-            instance_data = {}
-            if "locs" in self.current_td.keys():
-                instance_data['locs'] = self.current_td['locs'][idx].cpu().numpy()
-            if "demand" in self.current_td.keys():
-                instance_data['demand'] = self.current_td['demand'][idx].cpu().numpy()
-            if "prize" in self.current_td.keys():
-                instance_data['prize'] = self.current_td['prize'][idx].cpu().numpy()
-            instance_data['env_name'] = self.ml4co_env_name
-            return instance_data
-        return None
-
-    def build_text_obs(self, td, init: bool = False) -> List[str]:
-        """Build text observations using the correct env_name for ML4CO-Kit."""
-        postprocess_text_obs: List[str] = []
-
-        batch_size = td.batch_size[0]
-        env_name = self.rl4co_env_name
-
-        for i in range(batch_size):
-            if env_name == "tsp":
-                obs = self._format_tsp_obs_single(td, i, init=init)
-            elif env_name == "cvrp":
-                obs = self._format_cvrp_obs_single(td, i, init=init)
-            elif env_name == "op":
-                obs = self._format_op_obs_single(td, i, init=init)
-            else:
-                # Fallback to generic TSP-style description if unknown
-                obs = self._format_tsp_obs_single(td, i, init=init)
+    def build_text_obs(self, text_obs) -> List[str]:
+        postprocess_text_obs = []
+        Template = RL4CO_TSP_TEMPLATE if self.return_topk_options else RL4CO_TSP_TEMPLATE_NO_HIS
+        for i in range(len(text_obs)):
+            obs = Template.format(
+                    text_obs = text_obs[i]
+                )
             postprocess_text_obs.append(obs)
-
         return postprocess_text_obs
-
-    def step(self, text_actions: List[str]):
-        actions, valids = self.projection_f(text_actions)
-        next_td, env_rewards, dones, infos = self.envs.step(actions)
-        env_rewards_np = to_numpy(env_rewards)
-
-        rewards = env_rewards_np
-        format_info: Dict[str, Any] = {}
-        if self.use_format_reward:
-            num_nodes = next_td["locs"].shape[1] if "locs" in next_td.keys() else None
-            final_rewards, format_info = compute_format_reward(
-                valids=valids,
-                actions=actions,
-                env_rewards=env_rewards_np,
-                env_name=self.rl4co_env_name,
-                env_type="routing",
-                format_reward_weight=self.format_reward_weight,
-                feasibility_reward_weight=self.feasibility_reward_weight,
-                num_nodes=num_nodes,
-                start_node=0,
-                use_conditional_reward=self.use_conditional_reward,
-                feasibility_threshold=self.feasibility_threshold,
-                normalize_env_reward=self.normalize_env_reward,
-                env_reward_range=self.env_reward_range,
-                fixed_scale_reference=self.fixed_scale_reference,
-            )
-            rewards = final_rewards
-
-        final_infos: List[Dict[str, Any]] = []
-        for i, info in enumerate(infos):
-            info_dict = dict(info) if info else {}
-            info_dict["is_action_valid"] = to_numpy(valids[i])
-            if self.use_format_reward:
-                info_dict["format_bonus"] = float(format_info.get("format_bonuses", [0])[i])
-                info_dict["feasibility_bonus"] = float(format_info.get("feasibility_bonuses", [0])[i])
-                info_dict["env_reward"] = float(format_info.get("env_rewards", env_rewards_np)[i])
-                if "format_reward" in format_info:
-                    info_dict["format_reward"] = float(format_info["format_reward"][i])
-                    info_dict["feasibility_reward"] = float(format_info["feasibility_reward"][i])
-                    info_dict["scaled_env_reward"] = float(format_info["env_reward"][i])
-                    info_dict["env_reward_weight"] = float(format_info["env_reward_weight"][i])
-                    info_dict["meets_feasibility_threshold"] = bool(format_info.get("feasibility_mask", [False])[i])
-            final_infos.append(info_dict)
-
-        dones_np = to_numpy(dones) if dones is not None else None
-        next_observations = {"text": self.pre_text_obs, "image": None, "anchor": self.pre_text_obs}
-        return next_observations, rewards, dones_np, final_infos
 
 def make_envs(config):
     """
     Create enviroments 
     """ 
-    # check if config.env.rollout.n is an integer
-    if not isinstance(config.env.rollout.n, int):
-        raise ValueError("config.env.rollout.n should be an integer")
-    group_n = config.env.rollout.n if config.env.rollout.n > 0 else 1
-    resources_per_worker = _to_container(config.env.resources_per_worker, resolve=True)
+    group_n = config.group_n
 
-    if "search" in config.env.env_name.lower():
+    if "search" in config.env_name.lower():
         from agent_system.environments.env_package.search import build_search_envs, search_projection
         _envs = build_search_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_config=config.env)
         _val_envs = build_search_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_config=config.env)
@@ -1345,35 +1114,35 @@ def make_envs(config):
         envs = SearchEnvironmentManager(_envs, projection_f, config)
         val_envs = SearchEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
-    elif "gym_cards" in config.env.env_name.lower():
+    elif "gym_cards" in config.env_name.lower():
         from agent_system.environments.env_package.gym_cards import build_gymcards_envs, gym_projection
-        _envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, resources_per_worker=resources_per_worker)
-        _val_envs = build_gymcards_envs(env_name=config.env.env_name, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, resources_per_worker=resources_per_worker)
+        _envs = build_gymcards_envs(env_name=config.env_name, seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True)
+        _val_envs = build_gymcards_envs(env_name=config.env_name, seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False)
         
-        projection_f = partial(gym_projection, env_name=config.env.env_name)
+        projection_f = partial(gym_projection, env_name=config.env_name)
         envs = GymCardEnvironmentManager(_envs, projection_f, config)
         val_envs = GymCardEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
-    elif "alfworld" in config.env.env_name.lower():
+    elif "alfworld" in config.env_name.lower():
         from agent_system.environments.env_package.alfworld import build_alfworld_envs, alfworld_projection
-        if config.env.env_name == 'alfworld/AlfredThorEnv':
+        if config.env_name == 'alfworld/AlfredThorEnv':
             alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
-        elif config.env.env_name == 'alfworld/AlfredTWEnv':
+        elif config.env_name == 'alfworld/AlfredTWEnv':
             alf_config_path = os.path.join(os.path.dirname(__file__), 'env_package/alfworld/configs/config_tw.yaml')
         else:
-            raise ValueError(f"Unsupported environment: {config.env.env_name}")
+            raise ValueError(f"Unsupported environment: {config.env_name}")
 
         env_kwargs = {
             'eval_dataset': config.env.alfworld.eval_dataset, # 'eval_in_distribution' or 'eval_out_of_distribution'
         }
-        _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+        _envs = build_alfworld_envs(alf_config_path, config.env.seed, config.data.train_batch_size, group_n, is_train=True, env_kwargs=env_kwargs)
+        _val_envs = build_alfworld_envs(alf_config_path, config.env.seed + 1000, config.data.val_batch_size, 1, is_train=False, env_kwargs=env_kwargs)
         
         projection_f = partial(alfworld_projection)
         envs = AlfWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AlfWorldEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
-    elif "sokoban" in config.env.env_name.lower():
+    elif "sokoban" in config.env_name.lower():
         from agent_system.environments.env_package.sokoban import build_sokoban_envs, sokoban_projection
         env_kwargs = {
             'dim_room': config.env.sokoban.dim_room,
@@ -1381,14 +1150,14 @@ def make_envs(config):
             'max_steps': config.env.max_steps,
             'search_depth': config.env.sokoban.search_depth
         }
-        _envs = build_sokoban_envs(config.env.seed, config.data.train_batch_size, group_n, mode=config.env.sokoban.mode, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        _val_envs = build_sokoban_envs(config.env.seed + 1000, config.data.val_batch_size, 1, mode=config.env.sokoban.mode, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+        _envs = build_sokoban_envs(config.env.seed, config.data.train_batch_size, group_n, mode=config.env.sokoban.mode, is_train=True, env_kwargs=env_kwargs)
+        _val_envs = build_sokoban_envs(config.env.seed + 1000, config.data.val_batch_size, 1, mode=config.env.sokoban.mode, is_train=False, env_kwargs=env_kwargs)
         
         projection_f = partial(sokoban_projection)
         envs = SokobanEnvironmentManager(_envs, projection_f, config)
         val_envs = SokobanEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
-    elif "webshop" in config.env.env_name.lower():
+    elif "webshop" in config.env_name.lower():
         from agent_system.environments.env_package.webshop import build_webshop_envs, webshop_projection
         if config.env.webshop.use_small:
             file_path = os.path.join(os.path.dirname(__file__), 'env_package/webshop/webshop/data/items_shuffle_1000.json')
@@ -1403,8 +1172,8 @@ def make_envs(config):
                     'file_path': file_path,
                     'attr_path': attr_path
                     }
-        _envs = build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
-        _val_envs = build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs, resources_per_worker=resources_per_worker)
+        _envs = build_webshop_envs(seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, is_train=True, env_kwargs=env_kwargs)
+        _val_envs = build_webshop_envs(seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, is_train=False, env_kwargs=env_kwargs)
 
         projection_f = partial(webshop_projection)
         envs = WebshopEnvironmentManager(_envs, projection_f, config)
@@ -1412,16 +1181,16 @@ def make_envs(config):
         import time
         time.sleep((config.data.train_batch_size * group_n + config.data.val_batch_size) * 0.1) # wait for the envs to be ready
         return envs, val_envs
-    elif "appworld" in config.env.env_name.lower():
+    elif "appworld" in config.env_name.lower():
         from agent_system.environments.env_package.appworld import build_appworld_envs, appworld_projection
-        _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
-        _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n, resources_per_worker=resources_per_worker)
+        _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0)
+        _val_envs = build_appworld_envs(dataset_name='test_normal', seed=config.env.seed + 1000, env_num=config.data.val_batch_size, group_n=1, start_server_id=config.data.train_batch_size*group_n)
         
         projection_f = partial(appworld_projection)
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
-    elif config.env.env_name.lower().startswith("ml4co-kit/"):
+    elif config.env_name.lower().startswith("ml4co-kit/"):
         from agent_system.environments.env_package.ml4co_kit import (
             build_ml4cokit_routing_envs,
             build_ml4cokit_scheduling_envs,
@@ -1429,7 +1198,7 @@ def make_envs(config):
             ml4cokit_scheduling_projection,
         )
 
-        sub_env = config.env.env_name.lower().split("/", 1)[1]
+        sub_env = config.env_name.lower().split("/", 1)[1]
         if sub_env in ("tsp", "cvrp", "op"):
             ml4co_cfg = getattr(config.env, "ml4co_kit", getattr(config.env, "rl4co", {}))
             device = getattr(ml4co_cfg, "device", "cpu")
@@ -1438,8 +1207,8 @@ def make_envs(config):
 
             _envs = build_ml4cokit_routing_envs(
                 env_name=sub_env,
-                seed=config.env.seed,
-                env_num=config.data.train_batch_size,
+                seed=config.seed,
+                env_num=config.train_batch_size,
                 group_n=group_n,
                 device=device,
                 generator_params=generator_params,
@@ -1490,20 +1259,17 @@ def make_envs(config):
             return envs, val_envs
         else:
             raise ValueError(f"Unsupported ml4co-kit env: {sub_env}")
-    elif "rl4co_scheduling" in config.env.env_name.lower():
+    elif "rl4co_scheduling" in config.env_name.lower():
         from agent_system.environments.env_package.rl4co_scheduling import (
             build_rl4co_scheduling_envs,
             rl4co_scheduling_projection,
         )
 
-        sched_cfg = getattr(config.env, "rl4co_scheduling", {})
-        sched_env_name = getattr(sched_cfg, "env_name", "jssp")
-        sched_device = getattr(sched_cfg, "device", "cpu")
-        generator_params = getattr(sched_cfg, "generator_params", {})
-        rl4co_kwargs = getattr(sched_cfg, "rl4co_kwargs", {})
-        generator_params = _to_container(generator_params, resolve=True)
-        rl4co_kwargs = _to_container(rl4co_kwargs, resolve=True)
-        one_step_sched = False
+        sched_env_name = config.env_name
+        sched_device = config.device
+        generator_params = config.generator_params
+        rl4co_kwargs = config.rl4co_kwargs
+        return_topk_options = config.return_topk_options
 
         _envs = build_rl4co_scheduling_envs(
             env_name=sched_env_name,
@@ -1513,6 +1279,7 @@ def make_envs(config):
             device=sched_device,
             generator_params=generator_params,
             rl4co_kwargs=rl4co_kwargs,
+            return_topk_options=return_topk_options,
         )
         _val_envs = build_rl4co_scheduling_envs(
             env_name=sched_env_name,
@@ -1522,60 +1289,70 @@ def make_envs(config):
             device=sched_device,
             generator_params=generator_params,
             rl4co_kwargs=rl4co_kwargs,
+            return_topk_options=return_topk_options,
         )
 
         projection_f = partial(
             rl4co_scheduling_projection,
-            one_step=one_step_sched,
             env_name=sched_env_name,
         )
         envs = RL4COSchedulingEnvironmentManager(_envs, projection_f, config)
         val_envs = RL4COSchedulingEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
-    elif "rl4co" in config.env.env_name.lower():
+    elif "rl4co" in config.env_name.lower():
         from agent_system.environments.env_package.rl4co import (
-            build_rl4co_routing_envs,
-            rl4co_projection,
+            build_route_envs,
+            route_projection,
+            route_projection_selected,
         )
 
         # Resolve rl4co-specific config (with sensible defaults)
-        rl4co_cfg = getattr(config.env, "rl4co", {})
-        rl4co_env_name = getattr(rl4co_cfg, "env_name", "tsp")
-        rl4co_device = getattr(rl4co_cfg, "device", "cpu")
-        one_step_route = False
+        rl4co_env_name = config.env_name.split("/")[1]
+        rl4co_device = config.device
+        env_nums = config.train_batch_size
+        return_topk_options = config.return_topk_options
 
-        generator_params = getattr(rl4co_cfg, "generator_params", {})
-        rl4co_kwargs = getattr(rl4co_cfg, "rl4co_kwargs", {})
+        num_locs = np.random.randint(20,40, env_nums).tolist()
 
-        generator_params = _to_container(generator_params, resolve=True)
-        rl4co_kwargs = _to_container(rl4co_kwargs, resolve=True)
+        generator_params = SimpleNamespace(
+            num_loc=num_locs, 
+            min_loc=0.0, 
+            max_loc=1.0, 
+            min_prize=1.0, 
+            max_prize=2.0
+        )
+        generator_params = _to_container(generator_params)
 
-        _envs = build_rl4co_routing_envs(
+        _envs = build_route_envs(
             env_name=rl4co_env_name,
-            seed=config.env.seed,
-            env_num=config.data.train_batch_size,
+            seed=config.seed,
+            env_num=config.train_batch_size,
             group_n=group_n,
             device=rl4co_device,
             generator_params=generator_params,
-            rl4co_kwargs=rl4co_kwargs,
+            return_topk_options=return_topk_options,
         )
-        _val_envs = build_rl4co_routing_envs(
+        _val_envs = build_route_envs(
             env_name=rl4co_env_name,
-            seed=config.env.seed + 1000,
-            env_num=config.data.val_batch_size,
+            seed=config.seed + 1000,
+            env_num=config.val_batch_size,
             group_n=1,
             device=rl4co_device,
             generator_params=generator_params,
-            rl4co_kwargs=rl4co_kwargs,
+            return_topk_options=return_topk_options,
         )
-
-        projection_f = partial(
-            rl4co_projection,
-            one_step=one_step_route,
-            env_name=rl4co_env_name,
-        )
-        envs = RL4CORoutingEnvironmentManager(_envs, projection_f, config)
-        val_envs = RL4CORoutingEnvironmentManager(_val_envs, projection_f, config)
+        if return_topk_options > 0:
+            projection_f = partial(
+                route_projection_selected,
+                env_name=rl4co_env_name,
+            )
+        else:
+            projection_f = partial(
+                route_projection,
+                env_name=rl4co_env_name,
+            )
+        envs = RouteEnvironmentManager(_envs, projection_f, config)
+        val_envs = RouteEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
     else:
         print("Environment not supported")
@@ -1589,80 +1366,19 @@ if __name__ == "__main__":
     - ml4co-kit/* : one-shot routing (tsp/cvrp/op)
     """
     import time
-    import json
-    from types import SimpleNamespace as NS
 
-    def build_cfg(env_name: str):
-        resources = NS(num_cpus=0.1, num_gpus=0)
-        if env_name.startswith("ml4co-kit/"):
-            sub = env_name.split("/", 1)[1]
-            gen_params = NS(
-                num_loc=10,
-                min_demand=1,
-                max_demand=9,
-                min_capacity=20,
-                max_capacity=20,
-                max_length=3.0,
-            )
-            ml4co = NS(
-                env_name=sub,
-                device="cpu",
-                generator_params=gen_params,
-                rl4co_kwargs=NS(),
-                use_format_reward=True,
-                format_reward_weight=0.05,
-                feasibility_reward_weight=0.15,
-                use_conditional_reward=True,
-                feasibility_threshold=0.9,
-                normalize_env_reward=True,
-                env_reward_range=[-20.0, 0.0],
-                fixed_scale_reference=8.0,
-            )
-            env_cfg = NS(
-                env_name=env_name,
-                seed=0,
-                max_steps=50,
-                history_length=0,
-                rollout=NS(n=1),
-                resources_per_worker=resources,
-                ml4co_kit=ml4co,
-                rl4co=NS(env_name="tsp", device="cpu", generator_params=NS(), rl4co_kwargs=NS()),
-                rl4co_scheduling=NS(env_name="jssp", device="cpu", generator_params=NS(), rl4co_kwargs=NS()),
-            )
-        else:
-            sub = env_name.split("/", 1)[1] if "/" in env_name else env_name
-            rl4co = NS(
-                env_name=sub,
-                device="cpu",
-                generator_params=NS(num_loc=10, min_loc=0.0, max_loc=1.0, min_prize=1.0, max_prize=2.0),
-                rl4co_kwargs=NS(),
-                k_nn=2,
-                one_step=False,
-                use_format_reward=True,
-                format_reward_weight=0.05,
-                feasibility_reward_weight=0.15,
-                use_conditional_reward=True,
-                feasibility_threshold=0.9,
-                normalize_env_reward=True,
-                env_reward_range=[-20.0, 0.0],
-                fixed_scale_reference=8.0,
-            )
-            env_cfg = NS(
-                env_name=f"rl4co/{sub}",
-                seed=0,
-                max_steps=50,
-                history_length=2,
-                rollout=NS(n=1),
-                resources_per_worker=resources,
-                rl4co=rl4co,
-                rl4co_scheduling=NS(env_name="jssp", device="cpu", generator_params=NS(), rl4co_kwargs=NS()),
-            )
-        data_cfg = NS(train_batch_size=1, val_batch_size=1)
-        return NS(env=env_cfg, data=data_cfg)
-
-    env_name = "ml4co-kit/tsp"  # change to rl4co/tsp|cvrp|op or ml4co-kit/*
-    cfg = build_cfg(env_name)
-
+    env_name = "rl4co/tsp"  # change to rl4co/tsp|cvrp|op or ml4co-kit/*
+    
+    cfg = {
+        "train_batch_size": 3,
+        "val_batch_size": 1,
+        "env_name": env_name,
+        "seed": 0,
+        "group_n": 3,
+        "device":"cpu",
+        "return_topk_options": 3,
+    }
+    cfg = OmegaConf.create(cfg)
     print(f"[Manual test] env_name = {env_name}")
     t0 = time.time()
     envs, _ = make_envs(cfg)
@@ -1675,99 +1391,44 @@ if __name__ == "__main__":
     print(obs["text"][0])
     print("=" * 80)
 
-    is_one_shot = env_name.startswith("ml4co-kit/")
-
-    if is_one_shot:
-        sub = env_name.split("/", 1)[1]
-        print("\n[One-shot mode] Provide a complete solution.")
-        if sub in ("tsp", "op"):
-            print('JSON: {"route": [0,3,5,...]}')
-        elif sub == "cvrp":
-            print('JSON: {"routes": [[0,1,2,0],[0,3,4,0]]}')
-
-        user_input = input("\nEnter solution (JSON): ").strip()
-        if not user_input:
-            if sub in ("tsp", "op"):
-                user_input = json.dumps({"route": list(range(5)) + [0]})
-            else:
-                user_input = json.dumps({"routes": [[0, 1, 2, 0]]})
-        text_actions = [user_input]
-
-        obs, rewards, dones, infos = envs.step(text_actions)
+    max_steps = 100
+    for step_idx in range(max_steps):
         print("\n" + "=" * 80)
-        print("Results:")
+        print(f"Step {step_idx + 1}")
         print("=" * 80)
-        print(f"Rewards: {rewards}")
+        batch_size = len(obs["text"])
+        print(obs["text"][0])
+
+        text_actions = input("\nEnter action(s) (comma-separated): ").strip()
+        if not text_actions:
+            text_actions = "0"
+        acts = [a.strip() for a in text_actions.split(",")]
+        if len(acts) < batch_size:
+            acts.extend([acts[-1]] * (batch_size - len(acts)))
+
+        obs, rewards, dones, infos = envs.step(acts)
+        print(f"\nRewards: {rewards}")
         print(f"Dones: {dones}")
 
-        print("\n" + "-" * 80)
-        print("Reward Breakdown:")
-        print("-" * 80)
-        for i, info in enumerate(infos):
-            env_reward = info.get("env_reward", rewards[i])
-            print(f"\nEnv {i}:")
-            print(f"  Env Reward (original): {env_reward:.4f}")
-            if "format_reward" in info:
-                print(f"  Format Reward: {info.get('format_reward', 0):.4f}")
-                print(f"  Feasibility Reward: {info.get('feasibility_reward', 0):.4f}")
-                print(f"  Scaled Env Reward: {info.get('scaled_env_reward', 0):.4f}")
-                print(f"  Env Reward Weight: {info.get('env_reward_weight', 0):.4f}")
-                print(f"  Final Reward: {rewards[i]:.4f}")
-            elif "format_bonus" in info:
-                print(f"  Format Bonus: {info.get('format_bonus', 0):.4f}")
-                print(f"  Feasibility Bonus: {info.get('feasibility_bonus', 0):.4f}")
-                print(f"  Final Reward: {rewards[i]:.4f}")
-            else:
-                print(f"  Final Reward: {rewards[i]:.4f} (env only)")
+        if infos:
+            print("\nReward Breakdown:")
+            for i, info in enumerate(infos):
+                env_reward = info.get("env_reward", rewards[i])
+                if "format_reward" in info:
+                    print(f"  Env {i}: Format={info.get('format_reward',0):.4f}, "
+                            f"Feasibility={info.get('feasibility_reward',0):.4f}, "
+                            f"Env={info.get('scaled_env_reward',0):.4f}, "
+                            f"Final={rewards[i]:.4f}")
+                elif "format_bonus" in info:
+                    print(f"  Env {i}: FormatBonus={info.get('format_bonus',0):.4f}, "
+                            f"FeasibilityBonus={info.get('feasibility_bonus',0):.4f}, "
+                            f"Env={env_reward:.4f}, Final={rewards[i]:.4f}")
+                else:
+                    print(f"  Env {i}: Env={env_reward:.4f}, Final={rewards[i]:.4f}")
 
-        print("\n" + "-" * 80)
-        print("Solution echo:")
-        if "route" in infos[0]:
-            print(f"Route: {infos[0]['route']}")
-        elif "routes" in infos[0]:
-            print(f"Routes: {infos[0].get('routes')}")
-        elif "schedule" in infos[0]:
-            print(f"Schedule: {infos[0].get('schedule')}")
-    else:
-        max_steps = 20
-        for step_idx in range(max_steps):
+        done_flag = dones.all()
+        if done_flag:
             print("\n" + "=" * 80)
-            print(f"Step {step_idx + 1}")
+            print("Episode finished!")
             print("=" * 80)
-            batch_size = len(obs["text"])
-            print("Current observation (truncated):")
-            print(obs["text"][0][:800] + "..." if len(obs["text"][0]) > 800 else obs["text"][0])
-
-            text_actions = input("\nEnter action(s) (comma-separated): ").strip()
-            if not text_actions:
-                text_actions = "0"
-            acts = [a.strip() for a in text_actions.split(",")]
-            if len(acts) < batch_size:
-                acts.extend([acts[-1]] * (batch_size - len(acts)))
-
-            obs, rewards, dones, infos = envs.step(acts)
-            print(f"\nRewards: {rewards}")
-            print(f"Dones: {dones}")
-
-            if infos:
-                print("\nReward Breakdown:")
-                for i, info in enumerate(infos):
-                    env_reward = info.get("env_reward", rewards[i])
-                    if "format_reward" in info:
-                        print(f"  Env {i}: Format={info.get('format_reward',0):.4f}, "
-                              f"Feasibility={info.get('feasibility_reward',0):.4f}, "
-                              f"Env={info.get('scaled_env_reward',0):.4f}, "
-                              f"Final={rewards[i]:.4f}")
-                    elif "format_bonus" in info:
-                        print(f"  Env {i}: FormatBonus={info.get('format_bonus',0):.4f}, "
-                              f"FeasibilityBonus={info.get('feasibility_bonus',0):.4f}, "
-                              f"Env={env_reward:.4f}, Final={rewards[i]:.4f}")
-                    else:
-                        print(f"  Env {i}: Env={env_reward:.4f}, Final={rewards[i]:.4f}")
-
-            done_flag = dones[0] if isinstance(dones, (list, np.ndarray)) else dones
-            if done_flag:
-                print("\n" + "=" * 80)
-                print("Episode finished!")
-                print("=" * 80)
-                break
+            break

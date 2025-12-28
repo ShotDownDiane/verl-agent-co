@@ -59,11 +59,11 @@ def main():
                        default="/root/autodl-tmp/Qwen3VL-4B-Instruct",
                        help="Model path (for vllm/transformers mode)")
     parser.add_argument("--api-url", type=str, 
-                       default="http://localhost:8000/v1",
+                       default="https://api.siliconflow.cn/v1",
                        help="API base URL (for api mode)")
-    parser.add_argument("--api-key", type=str, default=None,
+    parser.add_argument("--api-key", type=str, default="sk-saxqqtlyqrpconxlgcslqhrgvhwnfmuhnimiyzfvpcxqgmkh",
                        help="API key (optional)")
-    parser.add_argument("--model-name", type=str, default="vlm",
+    parser.add_argument("--model-name", type=str, default="Qwen/Qwen3-VL-235B-A22B-Thinking",
                        help="Model name (for api mode)")
     parser.add_argument("--test-image", action="store_true",
                        help="Test image input")

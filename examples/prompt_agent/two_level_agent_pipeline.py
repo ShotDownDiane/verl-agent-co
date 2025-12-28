@@ -59,7 +59,7 @@ def build_env(env_name, env_num=1, sub_env="tsp"):
             device="cpu",
             generator_params=generator_params,
             rl4co_kwargs={},
-            use_format_reward=True,
+            use_format_reward=False,
             format_reward_weight=0.05,
             feasibility_reward_weight=0.15,
             use_conditional_reward=True,
@@ -89,6 +89,7 @@ def build_env(env_name, env_num=1, sub_env="tsp"):
             _envs = build_ml4cokit_routing_envs(
                 env_name=sub_env,
                 seed=1,
+                mode="test",
                 env_num=env_num,
                 group_n=group_n,
                 device=ml4co_cfg.device,
@@ -262,31 +263,28 @@ class TwoLevelAgent:
         Returns:
             生成的策略
         """
-        strategy_prompt = f"""你是一个优化问题分析专家。请分析以下问题并生成解决策略。
+        strategy_prompt = f"""Role: Spatial Optimization Strategist
+Input Data: {observation} + [Image provided]
 
-问题描述：
-{observation}
+Task: Analyze the city distribution and k-NN constraints to:
+1. Identify spatial clusters or geometric patterns.
+2. Define a high-level routing logic (e.g., "follow the perimeter then clear the center").
+3. Flag critical/isolated nodes that must be prioritized.
 
-请生成一个清晰的解决策略，包括：
-1. 问题类型识别
-2. 关键约束条件
-3. 推荐的解决思路
-4. 需要注意的要点
-
-策略："""
+Output: Provide a concise execution strategy for the next agent. No code. No final route."""
         
         try:
             if image_base64:
                 strategy = self.vlm_agent.generate(
                     strategy_prompt,
                     image=image_base64,
-                    max_tokens=300,
+                    max_tokens=1024,
                     temperature=0.7,
                 )
             else:
                 strategy = self.vlm_agent.generate(
                     strategy_prompt,
-                    max_tokens=300,
+                    max_tokens=512,
                     temperature=0.7,
                 )
             
@@ -308,25 +306,25 @@ class TwoLevelAgent:
         Returns:
             生成的解决方案
         """
-        solution_prompt = f"""你是一个优化问题求解专家。根据给定的策略，生成具体的解决方案。
+        solution_prompt = f"""Role: Precision Execution Engine
+Inputs: {observation}, Strategy: {strategy}
 
-问题描述：
-{observation}
+Mandatory Rules:
+1. Unique Visit: The "route" must include every city index exactly once.
+2. Closed Loop: The path is a cycle (last node returns to first). Do not repeat the start node in the list.
+3. Calculation: "objective" must be the total Euclidean distance of the entire cycle.
+4. No Prose: No CoT, no explanations, no code, no markdown backticks. Output raw JSON only.
 
-解决策略：
-{strategy}
-
-请根据上述策略，生成具体的、可执行的解决方案。解决方案应该：
-1. 遵循策略中的指导
-2. 满足所有约束条件
-3. 格式正确，可以直接执行
-
-解决方案："""
+Output Format:
+{{
+  "route": [node_indices],
+  "objective": total_distance
+}}"""
         
         try:
             solution = self.llm_agent.generate(
                 solution_prompt,
-                max_tokens=512,
+                max_tokens=2048,
                 temperature=0.3,  # 较低温度以获得更确定的输出
             )
             
@@ -339,20 +337,36 @@ class TwoLevelAgent:
 
 if __name__ == "__main__":
     # ======================= 参数设置 =======================
-    env_name = sys.argv[1] if len(sys.argv) > 1 else "ml4co-kit/tsp"
-    sub_env = sys.argv[2] if len(sys.argv) > 2 else "tsp"
-    
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env_name", default=os.environ.get("ENV_NAME", "ml4co-kit"))
+    parser.add_argument("--sub_env", default=os.environ.get("SUB_ENV", "tsp"))
+    parser.add_argument("--vlm_api_url", default=os.environ.get("VLM_API_URL", "http://localhost:8000/v1"))
+    parser.add_argument("--llm_api_url", default=os.environ.get("LLM_API_URL", "http://localhost:8001/v1"))
+    parser.add_argument("--api_key", default=os.environ.get("API_KEY", "token-abc123456"))
+    parser.add_argument("--mode", default=os.environ.get("MODE", "train"))
+    parser.add_argument("--env_num", default=os.environ.get("ENV_NUM", "3"))
+    parser.add_argument("--test_times", default=os.environ.get("TEST_TIMES", "1"))
+    parser.add_argument("--vlm_model_name", default=os.environ.get("VLM_MODEL_NAME", "vlm"))
+    parser.add_argument("--llm_model_name", default=os.environ.get("LLM_MODEL_NAME", "llm"))
+    args = parser.parse_args()
+
+    env_name = args.env_name
+    # If sub_env not provided explicitly, extract from env_name if possible, otherwise default to "tsp"
+    sub_env = args.sub_env if args.sub_env is not None else (env_name.split("/", 1)[1] if "/" in env_name else "tsp")
+
     # API 配置
-    vlm_api_url = os.environ.get("VLM_API_URL", "http://localhost:8000/v1")
-    llm_api_url = os.environ.get("LLM_API_URL", "http://localhost:8001/v1")
-    api_key = os.environ.get("API_KEY", "token-abc123456")
+    vlm_api_url = args.vlm_api_url
+    llm_api_url = args.llm_api_url
+    api_key = args.api_key
     
-    vlm_model_name = os.environ.get("VLM_MODEL_NAME", "vlm")
-    llm_model_name = os.environ.get("LLM_MODEL_NAME", "llm")
+    vlm_model_name = args.vlm_model_name
+    llm_model_name = args.llm_model_name
     
     # 实验参数
-    env_num = int(os.environ.get("ENV_NUM", "3"))
-    test_times = int(os.environ.get("TEST_TIMES", "1"))
+    env_num = int(args.env_num)
+    test_times = int(args.test_times)
     
     # 日志和轨迹目录设置
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -428,12 +442,16 @@ if __name__ == "__main__":
     all_env_rewards = []
     all_format_bonuses = []
     all_feasibility_bonuses = []
+    all_invalid_actions = []
     
     for test_idx in range(test_times):
         logging.info(f"\n{'='*60}")
         logging.info(f"Start test {test_idx + 1}/{test_times}")
         logging.info(f"{'='*60}")
         start_time = time.time()
+        
+        # Count invalid actions in this test (reward == -1000 indicates invalid action)
+        test_invalid_actions = 0
         
         # 重置环境
         obs, infos = env_manager.reset(kwargs={})
@@ -521,6 +539,10 @@ if __name__ == "__main__":
             test_rewards.append(reward)
             all_rewards.append(reward)
             
+            # 检测无效 action（env 返回 -1000 表示 action 无效）
+            if reward == -1000:
+                test_invalid_actions += 1
+            
             # 更新轨迹数据
             if i < len(trajectories):
                 trajectories[i]['reward'] = reward
@@ -588,6 +610,8 @@ if __name__ == "__main__":
             'rewards_std': float(np.std(test_rewards)),
             'env_rewards_avg': float(np.mean(test_env_rewards)),
             'env_rewards_std': float(np.std(test_env_rewards)),
+            'invalid_actions': test_invalid_actions,
+            'invalid_rate': float(test_invalid_actions) / float(env_num) if env_num > 0 else 0.0,
         }
         
         summary_path = os.path.join(trajectory_dir, f"test_{test_idx}_summary.json")
@@ -598,6 +622,9 @@ if __name__ == "__main__":
         except Exception as e:
             logging.warning(f"Failed to save test summary: {e}")
         
+        # Append test invalid count to overall list and log
+        all_invalid_actions.append(test_invalid_actions)
+        logging.info(f"Invalid actions (reward == -1000) in test {test_idx}: {test_invalid_actions} / {env_num} ({test_summary['invalid_rate']:.2%})")
         logging.info("=============== Single Test Summary ===============")
         logging.info(f"Rewards avg ± std: {np.mean(test_rewards):.4f} ± {np.std(test_rewards):.4f}")
         logging.info(f"Env Rewards avg ± std: {np.mean(test_env_rewards):.4f} ± {np.std(test_env_rewards):.4f}")
@@ -640,6 +667,11 @@ if __name__ == "__main__":
         'env_rewards_avg': float(np.mean(all_env_rewards)),
         'env_rewards_std': float(np.std(all_env_rewards)),
     }
+    
+    # Overall invalid action stats
+    total_invalid_actions = int(np.sum(all_invalid_actions)) if len(all_invalid_actions) > 0 else 0
+    final_summary['total_invalid_actions'] = total_invalid_actions
+    final_summary['invalid_rate'] = float(total_invalid_actions) / float(final_summary['total_envs']) if final_summary['total_envs'] > 0 else 0.0
     
     if any(all_format_bonuses):
         final_summary['format_bonuses_avg'] = float(np.mean(all_format_bonuses))
