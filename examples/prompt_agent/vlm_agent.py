@@ -78,7 +78,7 @@ class VLMAgent:
                 api_key=self.api_key or "token-abc123456",
                 base_url=self.api_base_url,
                 max_retries=3,
-                timeout=60.0,
+                timeout=240.0, # 如果是vllm的话应该更长
             )
             self.model_name = self.model_name or "vlm"
             self.mode = 'api'
@@ -265,7 +265,8 @@ class VLMAgent:
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{image_base64}"
+                        "url": f"data:image/png;base64,{image_base64}",
+                        "detail":"low"
                     }
                 }
             ]

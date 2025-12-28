@@ -1,7 +1,9 @@
-from .envs import (
+from .envs_routing import (
     ML4COKitRoutingEnvs,
-    ML4COKitSchedulingEnvs,
     build_ml4cokit_routing_envs,
+)
+from .envs_scheduling import (
+    ML4COKitSchedulingEnvs,
     build_ml4cokit_scheduling_envs,
 )
 from .projection import (

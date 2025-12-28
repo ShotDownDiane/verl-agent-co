@@ -1,10 +1,10 @@
-from .envs import RL4CORoutingEnvs, build_rl4co_routing_envs
-from .projection import rl4co_projection
+from .envs import RouteEnvs, build_route_envs
+from .projection import route_projection
 
 __all__ = [
-    "RL4CORoutingEnvs",
-    "build_rl4co_routing_envs",
-    "rl4co_projection",
+    "RouteEnvs",
+    "build_route_envs",
+    "route_projection",
 ]
 
 
