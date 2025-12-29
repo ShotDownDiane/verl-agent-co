@@ -1,4 +1,5 @@
-
+**/*.jpg
+**/*.tsp
 **/*.pt
 **/checkpoints
 **/wget-log
