@@ -24,6 +24,11 @@ class BaseCOWorker:
         return_topk_options: int = 0,
         **kwargs
     ):
+        if "load_from_path" in kwargs:
+            self.load_from_path = kwargs["load_from_path"]
+        else:
+            self.load_from_path = False
+
         self.env_name = env_name.lower()
         self.env_num = env_num
         self.device = torch.device(device)
@@ -45,7 +50,11 @@ class BaseCOWorker:
         """Reset all sub-environments."""
         self.done = False
         batch_size = Size([self.env_num])
-        td = self.base_env.reset(batch_size=batch_size)
+        if self.load_from_path:
+            _td = load_from_file(self.load_from_path, batch_size=batch_size)
+            td = self.base_env.reset(_td)
+        else:
+            td = self.base_env.reset(batch_size=batch_size)
         
         # Sync instances across the batch if necessary
         td = self._sync_instances(td)
@@ -76,9 +85,9 @@ class BaseCOWorker:
 
     def action_projection(self, env_idx, action):
         """Project action to valid space (handle TopK mapping and Masking)."""
-        
+
         # --- 1. Top-K Option Mode ---
-        if self.return_topk_options and len(self.actions) != 0:
+        if self.return_topk_options:
             try:
                 candidates = self._td["topk_acts"][env_idx]
                 try:

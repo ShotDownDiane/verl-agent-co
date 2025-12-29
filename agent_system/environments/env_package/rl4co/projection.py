@@ -3,7 +3,7 @@ from typing import Any, List, Tuple
 import re
 
 
-def route_projection(
+def co_projection(
     actions: List[str],
     env_name: str | None = None,
 ) -> Tuple[Any, List[int]]:
@@ -35,7 +35,7 @@ def route_projection(
 
     return parsed_actions, valids
 
-def route_projection_selected(
+def co_projection_selected(
     actions: List[str],
     env_name: str | None = None
 ) -> Tuple[List[int], List[int]]:

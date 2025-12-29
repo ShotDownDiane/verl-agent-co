@@ -1091,7 +1091,15 @@ class RouteEnvironmentManager(EnvironmentManagerBase):
     
     def build_text_obs(self, text_obs) -> List[str]:
         postprocess_text_obs = []
-        Template = RL4CO_TSP_TEMPLATE if self.return_topk_options else RL4CO_TSP_TEMPLATE_NO_HIS
+        if self.rl4co_env_name == "tsp":
+            Template = RL4CO_TSP_TEMPLATE if self.return_topk_options else RL4CO_TSP_TEMPLATE_NO_HIS
+        elif self.rl4co_env_name == "cvrp":
+            Template = RL4CO_CVRP_TEMPLATE if self.return_topk_options else RL4CO_CVRP_TEMPLATE_NO_HIS
+        elif self.rl4co_env_name == "op":
+            Template = RL4CO_OP_TEMPLATE if self.return_topk_options else RL4CO_OP_TEMPLATE_NO_HIS
+        else:
+            Template = RL4CO_TSP_TEMPLATE if self.return_topk_options else RL4CO_TSP_TEMPLATE_NO_HIS
+
         for i in range(len(text_obs)):
             obs = Template.format(
                     text_obs = text_obs[i]
@@ -1099,6 +1107,120 @@ class RouteEnvironmentManager(EnvironmentManagerBase):
             postprocess_text_obs.append(obs)
         return postprocess_text_obs
         
+
+class GraphEnvironmentManager(EnvironmentManagerBase):
+    """EnvironmentManager for RL4CO graph envs (FLP, MCLP, STP)."""
+    def __init__(self, envs, projection_f, config):
+        self.memory = SimpleMemory()
+        self.rl4co_env_name = getattr(config.env.rl4co, "env_name", "flp").lower() if hasattr(config, "env") and getattr(config.env, "rl4co", None) else config.env_name.split("/")[-1].lower()
+        self.return_topk_options = config.return_topk_options
+        # Format reward configuration (optional)
+        rl4co_cfg = getattr(config.env, "rl4co", {}) if hasattr(config, "env") else {}
+        self.use_format_reward = getattr(rl4co_cfg, "use_format_reward", True)
+        self.format_reward_weight = getattr(rl4co_cfg, "format_reward_weight", 0.05)
+        self.feasibility_reward_weight = getattr(rl4co_cfg, "feasibility_reward_weight", 0.15)
+        self.use_conditional_reward = getattr(rl4co_cfg, "use_conditional_reward", True)
+        self.feasibility_threshold = getattr(rl4co_cfg, "feasibility_threshold", 0.9)
+        self.normalize_env_reward = getattr(rl4co_cfg, "normalize_env_reward", True)
+        self.env_reward_range = getattr(rl4co_cfg, "env_reward_range", None)
+        self.fixed_scale_reference = getattr(rl4co_cfg, "fixed_scale_reference", None)
+
+        super().__init__(envs, projection_f, config)
+
+    def reset(self, kwargs=None) -> Dict[str, Any]:
+        # Some env implementations accept kwargs, others do not.
+        try:
+            res = self.envs.reset(kwargs=kwargs) if kwargs is not None else self.envs.reset()
+        except TypeError:
+            res = self.envs.reset()
+
+        # Accept different return signatures:
+        # (text_obs_list, image_obs_list, infos) or (text_obs_list, infos)
+        if isinstance(res, tuple) and len(res) == 3:
+            text_obs_list, image_obs_list, infos = res
+        elif isinstance(res, tuple) and len(res) == 2:
+            text_obs_list, infos = res
+            image_obs_list = None
+        else:
+            # Fallback: treat whole as text_obs
+            text_obs_list = res
+            image_obs_list = None
+            infos = [{} for _ in range(len(text_obs_list) if hasattr(text_obs_list, "__len__") else 1)]
+
+        batch_size = len(text_obs_list) if hasattr(text_obs_list, "__len__") else 1
+        self.memory.reset(batch_size=batch_size)
+        self.pre_text_obs = [""] * batch_size
+
+        text_obs_list = self.build_text_obs(text_obs_list)
+        observations = {"text": text_obs_list, "image": image_obs_list, "anchor": text_obs_list}
+        return observations, infos
+
+    def step(self, text_actions: List[str]):
+        actions, valids = self.projection_f(text_actions)
+
+        res = self.envs.step(actions)
+
+        # Accept multiple possible signatures:
+        # (text_obs_list, image_obs_list, rewards, dones, infos)
+        # (text_obs_list, rewards, dones, infos)
+        if isinstance(res, tuple) and len(res) == 5:
+            next_text_obs, image_obs_list, env_rewards, dones, infos = res
+        elif isinstance(res, tuple) and len(res) == 4:
+            next_text_obs, env_rewards, dones, infos = res
+            image_obs_list = None
+        else:
+            # Unexpected shape
+            raise ValueError("Unexpected return shape from routing envs.step")
+
+        # Store history and update textual observations
+        self.memory.store({"text_obs": self.pre_text_obs, "action": actions})
+        text_obs = next_text_obs
+        self.pre_text_obs = text_obs
+
+        env_rewards = to_numpy(env_rewards)
+
+        # Compute format reward if enabled
+        format_bonuses = None
+        if self.use_format_reward:
+            format_bonuses = np.array([1.0 if v == 1 else 0.0 for v in valids], dtype=np.float32)
+            final_rewards = env_rewards + self.format_reward_weight * format_bonuses
+            rewards = final_rewards
+        else:
+            rewards = env_rewards
+
+        # Enrich infos
+        for i, info in enumerate(infos):
+            if info is None:
+                infos[i] = {}
+                info = infos[i]
+            info["is_action_valid"] = to_numpy(valids[i])
+            if self.use_format_reward and format_bonuses is not None:
+                info["format_bonus"] = float(format_bonuses[i])
+                info["env_reward"] = float(env_rewards[i])
+
+        dones = to_numpy(dones) if dones is not None else None
+        text_obs = self.build_text_obs(text_obs)
+        next_observations = {"text": text_obs, "image": image_obs_list, "anchor": text_obs}
+        return next_observations, rewards, dones, infos
+    
+    def build_text_obs(self, text_obs) -> List[str]:
+        postprocess_text_obs = []
+        if self.rl4co_env_name == "flp":
+            Template = RL4CO_FLP_TEMPLATE if self.return_topk_options else RL4CO_FLP_TEMPLATE_NO_HIS
+        elif self.rl4co_env_name == "mclp":
+            Template = RL4CO_MCLP_TEMPLATE if self.return_topk_options else RL4CO_MCLP_TEMPLATE_NO_HIS
+        elif self.rl4co_env_name == "stp":
+            Template = RL4CO_STP_TEMPLATE if self.return_topk_options else RL4CO_STP_TEMPLATE_NO_HIS
+        else:
+            Template = RL4CO_FLP_TEMPLATE if self.return_topk_options else RL4CO_FLP_TEMPLATE_NO_HIS
+
+        for i in range(len(text_obs)):
+            obs = Template.format(
+                    text_obs = text_obs[i]
+                )
+            postprocess_text_obs.append(obs)
+        return postprocess_text_obs
+
 
 def make_envs(config):
     """
@@ -1303,8 +1425,9 @@ def make_envs(config):
     elif "rl4co" in config.env_name.lower():
         from agent_system.environments.env_package.rl4co import (
             build_route_envs,
-            route_projection,
-            route_projection_selected,
+            build_graph_env,
+            co_projection,
+            co_projection_selected,
         )
 
         # Resolve rl4co-specific config (with sensible defaults)
@@ -1324,37 +1447,70 @@ def make_envs(config):
         )
         generator_params = _to_container(generator_params)
 
-        _envs = build_route_envs(
-            env_name=rl4co_env_name,
-            seed=config.seed,
-            env_num=config.train_batch_size,
-            group_n=group_n,
-            device=rl4co_device,
-            generator_params=generator_params,
-            return_topk_options=return_topk_options,
-        )
-        _val_envs = build_route_envs(
-            env_name=rl4co_env_name,
-            seed=config.seed + 1000,
-            env_num=config.val_batch_size,
-            group_n=1,
-            device=rl4co_device,
-            generator_params=generator_params,
-            return_topk_options=return_topk_options,
-        )
-        if return_topk_options > 0:
-            projection_f = partial(
-                route_projection_selected,
+        if rl4co_env_name in ["flp", "mclp", "stp"]:
+            _envs = build_graph_env(
                 env_name=rl4co_env_name,
+                seed=config.seed,
+                env_num=config.train_batch_size,
+                group_n=group_n,
+                device=rl4co_device,
+                generator_params=generator_params,
+                return_topk_options=return_topk_options,
             )
+            _val_envs = build_graph_env(
+                env_name=rl4co_env_name,
+                seed=config.seed + 1000,
+                env_num=config.val_batch_size,
+                group_n=1,
+                device=rl4co_device,
+                generator_params=generator_params,
+                return_topk_options=return_topk_options,
+            )
+            if return_topk_options > 0:
+                projection_f = partial(
+                    co_projection_selected,
+                    env_name=rl4co_env_name,
+                )
+            else:
+                projection_f = partial(
+                    co_projection,
+                    env_name=rl4co_env_name,
+                )
+            envs = GraphEnvironmentManager(_envs, projection_f, config)
+            val_envs = GraphEnvironmentManager(_val_envs, projection_f, config)
+            return envs, val_envs
         else:
-            projection_f = partial(
-                route_projection,
+            _envs = build_route_envs(
                 env_name=rl4co_env_name,
+                seed=config.seed,
+                env_num=config.train_batch_size,
+                group_n=group_n,
+                device=rl4co_device,
+                generator_params=generator_params,
+                return_topk_options=return_topk_options,
             )
-        envs = RouteEnvironmentManager(_envs, projection_f, config)
-        val_envs = RouteEnvironmentManager(_val_envs, projection_f, config)
-        return envs, val_envs
+            _val_envs = build_route_envs(
+                env_name=rl4co_env_name,
+                seed=config.seed + 1000,
+                env_num=config.val_batch_size,
+                group_n=1,
+                device=rl4co_device,
+                generator_params=generator_params,
+                return_topk_options=return_topk_options,
+            )
+            if return_topk_options > 0:
+                projection_f = partial(
+                    co_projection_selected,
+                    env_name=rl4co_env_name,
+                )
+            else:
+                projection_f = partial(
+                    co_projection,
+                    env_name=rl4co_env_name,
+                )
+            envs = RouteEnvironmentManager(_envs, projection_f, config)
+            val_envs = RouteEnvironmentManager(_val_envs, projection_f, config)
+            return envs, val_envs
     else:
         print("Environment not supported")
         exit(1)
@@ -1377,7 +1533,7 @@ if __name__ == "__main__":
         "seed": 0,
         "group_n": 3,
         "device":"cpu",
-        "return_topk_options": 3,
+        "return_topk_options": 5,
     }
     cfg = OmegaConf.create(cfg)
     print(f"[Manual test] env_name = {env_name}")
