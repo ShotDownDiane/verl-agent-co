@@ -101,9 +101,15 @@ Solve the Facility Location Problem (FLP). You need to select a subset of facili
 
 Input:
 {text_obs}
-
-Which option is the best next step? 
 Response strictly in the format: "Therefore, the final answer is: \\boxed{{OPTION_LETTER}}".
+"""
+
+RL4CO_FLP_TEMPLATE_COT = """
+Solve the Facility Location Problem (FLP). You need to select a subset of facilities to open to minimize the total cost.
+
+Input:
+{text_obs}
+Solve the problem efficiently and clearly. Think step-by-step before answering. The last line of your response should be: "Therefore, the final answer is: \\boxed{{OPTION_LETTER}}".
 """
 
 RL4CO_MCLP_TEMPLATE_NO_HIS = """

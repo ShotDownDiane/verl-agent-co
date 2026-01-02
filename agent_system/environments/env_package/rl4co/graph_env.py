@@ -5,9 +5,20 @@ from tensordict.tensordict import TensorDict
 # Import RL4CO graph environments
 # Note: Ensure these are installed/accessible in the environment
 try:
-    from rl4co.envs.graph import FLPEnv, MCLPEnv, MCPEnv, STPEnv
+    from rl4co.envs.graph import FLPEnv, MCPEnv
+    # Check if MCLPEnv and STPEnv exist, otherwise set to None
+    try:
+        from rl4co.envs.graph import MCLPEnv
+    except ImportError:
+        MCLPEnv = None
+        
+    try:
+        from rl4co.envs.graph import STPEnv
+    except ImportError:
+        STPEnv = None
+        
 except ImportError:
-    # Fallback or placeholder if direct import fails, though user environment suggests they exist
+    # Fallback or placeholder if direct import fails
     FLPEnv, MCLPEnv, MCPEnv, STPEnv = None, None, None, None
 
 from .base_env import BaseCOWorker, BaseCOEnvs
@@ -34,9 +45,11 @@ class GraphWorker(BaseCOWorker):
         device: str = "cpu",
         num_loc: int = 20, # Default for graph envs if needed
         return_topk_options: int = 0,
+        image_obs: bool = False,
         env_kwargs: Optional[Dict[str, Any]] = None,
     ):
         self.num_loc = num_loc
+        self.image_obs = image_obs
         self.env_kwargs = env_kwargs
 
         super().__init__(
@@ -44,7 +57,8 @@ class GraphWorker(BaseCOWorker):
             seed=seed,
             env_num=env_num,
             device=device,
-            return_topk_options=return_topk_options
+            return_topk_options=return_topk_options,
+            **env_kwargs,
         )
 
     def _init_env(self, seed: int, **kwargs):
@@ -73,11 +87,17 @@ class GraphWorker(BaseCOWorker):
              generator_params["num_loc"] = self.num_loc
 
         # Merge with any extra generator params from env_kwargs
+        generator = None
         if self.env_kwargs and "generator_params" in self.env_kwargs:
             generator_params.update(self.env_kwargs["generator_params"])
+            if generator is None and "generator" in generator_params:
+                generator = generator_params.pop("generator")
+        elif 'generator' in kwargs:
+            generator = kwargs.pop('generator')
 
         # Initialize environment
         return env_cls(
+            generator=generator,
             generator_params=generator_params,
             seed=seed,
             device=self.device,
@@ -92,16 +112,19 @@ class GraphWorker(BaseCOWorker):
         return td
 
 
-    def build_obs(self, td: TensorDict) -> List[str]:
+    def build_obs(self, td: TensorDict) -> List[Any]:
         """Delegate observation building to specific functions defined in graph_obs.py"""
         env_key = self.env_name.lower()
         builder = self.ENV_CONFIG[env_key]['builder']
         
         if builder:
             # Graph builders typically take (td, env_num, top_k)
-            # They don't typically use trajectory like Route envs do, 
-            # or if they do, it's embedded in td (e.g. 'chosen').
-            return builder(td, self.env_num, top_k=self.topk_k)
+            # We add image_obs to support VLM
+            try:
+                return builder(td, self.env_num, top_k=self.topk_k, image_obs=self.image_obs)
+            except TypeError:
+                # Fallback for builders that don't support image_obs yet
+                return builder(td, self.env_num, top_k=self.topk_k)
         else:
             return [f"No observation builder defined for {self.env_name}"] * self.env_num
 

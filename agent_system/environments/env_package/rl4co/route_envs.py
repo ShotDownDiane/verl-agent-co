@@ -34,12 +34,14 @@ class RouteWorker(BaseCOWorker):
         num_loc: int = 10,
         loc_distribution: str = "uniform",
         return_topk_options: int = 0,
+        image_obs: bool = False,
         env_kwargs: Optional[Dict[str, Any]] = None,
     ):
         # Store routing-specific params
         self.num_loc = num_loc
         self.loc_distribution = loc_distribution
         self.env_kwargs = env_kwargs
+        self.image_obs = image_obs
         
         # Call base init
         super().__init__(
@@ -66,8 +68,15 @@ class RouteWorker(BaseCOWorker):
         if self.env_kwargs and "generator_params" in self.env_kwargs:
             generator_params.update(self.env_kwargs["generator_params"])
         
+        # Check if a generator instance is provided in env_kwargs
+        generator = self.env_kwargs.get("generator", None) if self.env_kwargs else None
+        
+        # Also check inside generator_params for "_generator_obj" (hack to pass via config)
+        if generator is None and "generator" in generator_params:
+            generator = generator_params.pop("generator")
+
         return env_cls(
-            generator=None,
+            generator=generator,
             generator_params=generator_params,
             seed=seed,
             device=self.device
@@ -107,8 +116,8 @@ class RouteWorker(BaseCOWorker):
                 td=td, 
                 env_num=self.env_num, 
                 trajectory=self.actions,
-                return_topk_options=self.return_topk_options,
-                top_k=self.topk_k
+                top_k=self.topk_k,
+                image_obs=self.image_obs,
             )
         else:
             return [f"No observation builder defined for {self.env_name}"] * self.env_num

@@ -97,8 +97,15 @@ class VLMAgent:
                 return client.chat.completions.create(
                     model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
                 )
-        except Exception:
-            pass
+        except Exception as e:
+            # Only ignore if it's an AttributeError (meaning client doesn't support this)
+            # If it's a API error (e.g. AuthenticationError), we should probably raise it or log it
+            logger.warning(f"OpenAI-like call failed: {e}")
+            # If it was an OpenAI client, falling back to 'post' is risky if the error was unrelated to method existence
+            if "got an unexpected keyword argument" in str(e) or "object has no attribute" in str(e):
+                 pass # Fallback to next method
+            else:
+                 raise e # Re-raise real API errors
 
         # callable client (user provided function)
         if callable(client):

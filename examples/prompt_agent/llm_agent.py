@@ -73,10 +73,10 @@ class LLMAgent:
             from openai import OpenAI
 
             self.client = OpenAI(
-                api_key=self.api_key or "token-abc123456",
+                api_key=self.api_key,
                 base_url=self.api_base_url,
                 max_retries=3,
-                timeout=60.0,
+                timeout=180.0,
             )
             self.model_name = self.model_name or "llm"
             self.mode = 'api'
@@ -90,13 +90,10 @@ class LLMAgent:
         """统一调用不同 API 客户端的 chat completions"""
         client = self.client
         # openai-like client
-        try:
-            if hasattr(client, "chat") and hasattr(client.chat, "completions"):
-                return client.chat.completions.create(
-                    model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
-                )
-        except Exception:
-            pass
+        if hasattr(client, "chat") and hasattr(client.chat, "completions"):
+            return client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature, max_tokens=max_tokens
+            )
 
         # callable client (user provided function)
         if callable(client):
@@ -105,7 +102,11 @@ class LLMAgent:
         # requests-like client (Session) or raw HTTP fallback
         try:
             import requests
-            session = client if hasattr(client, "post") else requests
+            # Only use client as session if it looks like a requests Session
+            session = requests
+            if hasattr(client, "post") and hasattr(client, "get") and hasattr(client, "request"):
+                session = client
+                
             url = self.api_base_url.rstrip("/") + "/chat/completions"
             headers = {}
             if self.api_key:
@@ -211,7 +212,7 @@ class LLMAgent:
         self,
         text: Union[str, List[Dict[str, str]]],
         max_tokens: int = 512,
-        temperature: float = 0.7,
+        temperature: float = 1,
         system_prompt: Optional[str] = None,
     ) -> str:
         """使用 API 生成"""
@@ -247,7 +248,7 @@ class LLMAgent:
         self,
         text: Union[str, List[Dict[str, str]]],
         max_tokens: int = 512,
-        temperature: float = 0.7,
+        temperature: float = 1,
         system_prompt: Optional[str] = None,
     ) -> str:
         """使用 vLLM 生成"""
@@ -286,7 +287,7 @@ class LLMAgent:
         self,
         text: Union[str, List[Dict[str, str]]],
         max_tokens: int = 512,
-        temperature: float = 0.7,
+        temperature: float = 1,
         system_prompt: Optional[str] = None,
     ) -> str:
         """使用 transformers 生成"""
@@ -348,3 +349,16 @@ class LLMAgent:
         
         return result
 
+if __name__ == "__main__":
+    agent = LLMAgent(
+        api_base_url="https://api.siliconflow.cn/v1",
+        api_key="sk-saxqqtlyqrpconxlgcslqhrgvhwnfmuhnimiyzfvpcxqgmkh",
+        model_name="deepseek-ai/DeepSeek-V3.2"
+    )
+    
+    response = agent.generate(
+        text="你好",
+        max_tokens=128,
+        temperature=0.7
+    )
+    print(response)

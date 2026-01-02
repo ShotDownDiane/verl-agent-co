@@ -63,11 +63,12 @@ def co_projection_selected(
         
         # 严格限制只能是单个字母
         if len(clean_content) == 1 and clean_content.isalpha():
-            idx = ord(clean_content.upper()) - 65  # A=0, B=1...
-            if 0 <= idx < 26:
+            idx = ord(clean_content) - 65  # A=0, B=1...
+            if 0 <= idx < 50:
                 parsed_actions.append(idx)
                 valids.append(1)
             else:
+                
                 # 字母超出合理范围
                 parsed_actions.append(0)
                 valids.append(0)

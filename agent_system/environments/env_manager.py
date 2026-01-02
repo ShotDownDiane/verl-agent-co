@@ -23,7 +23,7 @@ from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.environments.format_reward import compute_format_reward
 from agent_system.memory import SimpleMemory, SearchMemory
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig, ListConfig
 from types import SimpleNamespace
 from scipy.spatial import cKDTree
 
@@ -67,9 +67,11 @@ def _to_container(obj, resolve=True):
             return result
         else:
             return {}
-    else:
+    elif isinstance(obj, (DictConfig, ListConfig)):
         # Use OmegaConf.to_container for OmegaConf objects
         return OmegaConf.to_container(obj, resolve=resolve)
+    else:
+        return obj
 
 
 def calculate_k_operators_with_lowest_processing_time(instance: np.ndarray, k: int) -> List[List[Tuple[int, int, float]]]:
@@ -1436,15 +1438,19 @@ def make_envs(config):
         env_nums = config.train_batch_size
         return_topk_options = config.return_topk_options
 
-        num_locs = np.random.randint(20,40, env_nums).tolist()
+        if hasattr(config, "generator_params") and config.generator_params is not None:
+            generator_params = config.generator_params
+        else:
+            num_locs = np.random.randint(20,40, env_nums).tolist()
 
-        generator_params = SimpleNamespace(
-            num_loc=num_locs, 
-            min_loc=0.0, 
-            max_loc=1.0, 
-            min_prize=1.0, 
-            max_prize=2.0
-        )
+            generator_params = SimpleNamespace(
+                num_loc=num_locs, 
+                min_loc=0.0, 
+                max_loc=1.0, 
+                min_prize=1.0, 
+                max_prize=2.0
+            )
+        
         generator_params = _to_container(generator_params)
 
         if rl4co_env_name in ["flp", "mclp", "stp"]:

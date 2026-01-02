@@ -35,6 +35,7 @@ class BaseCOWorker:
         self.actions: List[Any] = []
         self.return_topk_options = return_topk_options > 0
         self.topk_k = return_topk_options
+        self.synchronous = kwargs.get("synchronous", True)
         
         # Initialize the specific RL4CO environment
         # kwargs usually contains env_kwargs or specific params like num_loc
@@ -57,7 +58,8 @@ class BaseCOWorker:
             td = self.base_env.reset(batch_size=batch_size)
         
         # Sync instances across the batch if necessary
-        td = self._sync_instances(td)
+        if self.synchronous:
+            td = self._sync_instances(td)
         
         self._td = td
         self.actions = []
@@ -85,7 +87,7 @@ class BaseCOWorker:
 
     def action_projection(self, env_idx, action):
         """Project action to valid space (handle TopK mapping and Masking)."""
-
+    
         # --- 1. Top-K Option Mode ---
         if self.return_topk_options:
             try:
@@ -93,6 +95,7 @@ class BaseCOWorker:
                 try:
                     sel_idx = int(action) if not isinstance(action, torch.Tensor) else int(action.item())
                 except Exception:
+                    print(f"Error parsing action {action} to int. Defaulting to 0.")
                     sel_idx = 0 
 
                 if 0 <= sel_idx < len(candidates):
