@@ -4,10 +4,10 @@ import pickle
 import torch
 import numpy as np
 import re
+import traceback
 from types import SimpleNamespace
 from omegaconf import OmegaConf
 import ray
-
 import json
 
 class NumpyEncoder(json.JSONEncoder):
@@ -232,54 +232,39 @@ def get_solution_from_data(data_item):
     print("Warning: No explicit solution tour found in data item.")
     return None
 
-import torch
-import numpy as np
-import traceback
-
-def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
-    """
-    SFT 数据生成主循环
-    包含：Teacher Forcing, Geometric Injection, Swap-to-Last 策略
-    """
-    # print(f"Resetting environments...")
-    obs, infos = envs.reset()
+def run_agent_loop(worker, agent, solution_tour, env_name='flp'):
+    envs = worker.env if hasattr(worker, 'env') else worker
     
-    trajectory = []
-    obs_list = []
-    solution_tour_list = []
-    image_list = []
+    # Reset Environment
+    obs, _ = envs.reset()
     
-    # =========================================================================
-    # 1. 静态数据准备 (坐标 & 边列表)
-    # =========================================================================
+    # Prepare Data Storage
+    steps_data = []
     
-    # A. 获取全局坐标 (所有任务都需要计算几何距离)
-    all_coords = None
-    # 根据 tensordict 的不同 key 尝试获取
+    # A. 获取全局坐标 (所有环境共享/或单实例)
+    # 假设 batch_size=1，直接取第0个
+    all_coords_map = {}
+    all_coords = None # For legacy injection logic compatibility
+    
+    # 尝试从 envs._td 中提取坐标
     if hasattr(envs, '_td'):
+        coords_array = None
         if 'locs' in envs._td.keys():
-            all_coords = envs._td['locs'][0]
+            coords_array = envs._td['locs'][0]
         elif 'facility_locs' in envs._td.keys():
-            all_coords = envs._td['facility_locs'][0]
-    
-    # B. 获取全局边列表 (仅 STP/GSTP 需要)
-    # 我们需要知道 edge_idx 到底连接了哪两个点
-    global_edge_list = None
-    if env_name in ['stp', 'gstp'] and hasattr(envs, '_td'):
-        # 尝试获取 edge_index 或 edge_list
-        if 'edge_index' in envs._td.keys():
-            edges = envs._td['edge_index'][0]
-        elif 'edge_list' in envs._td.keys():
-            edges = envs._td['edge_list'][0]
-        else:
-            edges = None
+            coords_array = envs._td['facility_locs'][0]
             
-        if edges is not None:
-            # 统一转置为 [Num_Edges, 2] 格式，方便用 idx 索引
-            if edges.shape[0] == 2 and edges.shape[1] != 2: 
-                global_edge_list = edges.T 
-            else:
-                global_edge_list = edges
+        if coords_array is not None:
+            # Keep original reference for injection logic
+            all_coords = coords_array
+            
+            # Convert to Dict {id: [x, y]} for JSON output
+            temp_coords = coords_array
+            if isinstance(temp_coords, torch.Tensor):
+                temp_coords = temp_coords.cpu().numpy()
+            
+            for idx, coord in enumerate(temp_coords):
+                all_coords_map[int(idx)] = coord.tolist()
 
     tour_idx = 0
     i = 0
@@ -288,8 +273,6 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
     # 2. 交互主循环
     # =========================================================================
     while True:
-        # print(f"\n--- Step {i+1} ---")
-        
         # Robust obs handling
         curr_obs = obs[0]
         if isinstance(curr_obs, tuple):
@@ -302,26 +285,30 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
             img = None
 
         actions = []
-        # print(obs)
-        # a = input("Action: ")
         
         # 获取当前环境推荐的 Top-K 候选项 (Tensor 或 List)
-        # 注意：这里获取的是引用，稍后修改它会影响环境状态
         options_map = envs._td['topk_acts'][0]
+        
+        # Extract Candidates List for this step (New Requirement)
+        candidates_list = []
+        if isinstance(options_map, dict):
+            candidates_list = [int(k) for k in options_map.keys()]
+        else:
+            # Tensor or Array
+            c_vals = options_map.tolist() if hasattr(options_map, 'tolist') else list(options_map)
+            candidates_list = [int(x) for x in c_vals]
         
         chosen_label = "0" # Default fallback
         
         if solution_tour is not None:
             try:
                 # --- A. 准备标准答案集合 (Ground Truth) ---
-                # 将 tensor 转换为 python scalar，放入 set 方便 O(1) 查找
                 solution_set = set(s.item() if hasattr(s, 'item') else s for s in solution_tour)
                 
                 # --- B. 准备候选人列表 (Avail Candidates) ---
                 if isinstance(options_map, dict):
                     avail_candidates = list(options_map.keys())
                 else:
-                    # 转为 list 方便后续操作
                     avail_candidates = options_map.tolist() if hasattr(options_map, 'tolist') else list(options_map)
                 
                 # --- C. 第一轮尝试：直接查找交集 ---
@@ -333,22 +320,16 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
                     if c_val in solution_set:
                         target_cand = cand
                         target_idx = k
-                        # print(f"Found target {c_val} in solution set.")
                         break
                 
                 # --- D. 核心修改：注入与替换策略 (如果不匹配) ---
-                # 如果 Top-K 全军覆没，且我们要强行教学
                 if target_cand is None and len(solution_set) > 0 and len(avail_candidates) > 0:
-                    # print(f"[{env_name.upper()}] Target not in Top-K. Calculating geometric replacement...")
-                    
                     if all_coords is None:
-                        # 如果没有坐标，无法计算距离，只能报错或跳过
                         raise ValueError("Coordinates (locs) not found in `envs`. Cannot perform injection.")
 
                     remaining_opt_items = list(solution_set)
                     best_swap_pair = None 
                     min_dist = float('inf')
-
 
                     for k_idx, c_node in enumerate(avail_candidates):
                         c_val = c_node.item() if hasattr(c_node, 'item') else c_node
@@ -357,78 +338,70 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
                         for o_node in remaining_opt_items:
                             o_coord = all_coords[o_node]
                             
+                            # Euclidean Distance
                             if isinstance(c_coord, torch.Tensor):
-                                dist = torch.norm(c_coord - o_coord).item()
+                                d = torch.norm(c_coord - o_coord).item()
                             else:
-                                dist = np.linalg.norm(c_coord - o_coord)
+                                d = np.linalg.norm(c_coord - o_coord)
                             
-                            if dist < min_dist:
-                                min_dist = dist
+                            if d < min_dist:
+                                min_dist = d
                                 best_swap_pair = (k_idx, o_node)
                     
-                    # --- E. 执行注入 & 移至末位 (Swap to Last) ---
                     if best_swap_pair is not None:
                         swap_idx, swap_opt_item = best_swap_pair
                         
-                        # print(f"Injection ({env_name}): Removing Idx {swap_idx}, Appending Optimal {swap_opt_item} to Last.")
-
-                        # 获取容器引用
+                        # --- E. 修改 Top-K 容器 ---
                         acts_container = envs._td['topk_acts'][0]
+                        
+                        if isinstance(acts_container, dict):
+                            old_key = avail_candidates[swap_idx]
+                            if old_key in acts_container:
+                                val = acts_container.pop(old_key)
+                            else:
+                                val = 1.0 
+                            acts_container[swap_opt_item] = val
+                            avail_candidates[swap_idx] = swap_opt_item
+                            target_idx = swap_idx
+                            target_cand = swap_opt_item
+                            
+                            if swap_idx < len(candidates_list):
+                                candidates_list[swap_idx] = int(swap_opt_item)
 
-                        # -------------------------------------------------
-                        # 情况 1: PyTorch Tensor 处理
-                        # -------------------------------------------------
-                        if isinstance(acts_container, torch.Tensor):
-                            # 1. 构造新节点的 Tensor (保持与原容器相同的 Device 和 Dtype)
-                            # 注意：swap_opt_item 可能是 int 或 scalar tensor
+                        elif isinstance(acts_container, list):
+                            acts_container.pop(swap_idx)
+                            acts_container.append(swap_opt_item)
+                            target_idx = len(acts_container) - 1 
+                            target_cand = swap_opt_item
+                            
+                            candidates_list.pop(swap_idx)
+                            candidates_list.append(int(swap_opt_item))
+
+                        elif isinstance(acts_container, torch.Tensor):
                             new_val = swap_opt_item.item() if hasattr(swap_opt_item, 'item') else swap_opt_item
                             new_node_tensor = torch.tensor([new_val], dtype=acts_container.dtype, device=acts_container.device)
-
-                            # 2. 拼接操作：[0...swap_idx-1] + [swap_idx+1...end] + [new_node]
-                            # 即：跳过 swap_idx 处的元素，将其余拼接，最后加上新元素
                             part_before = acts_container[:swap_idx]
                             part_after = acts_container[swap_idx+1:]
-                            
-                            new_container = torch.cat([part_before, new_node_tensor, part_after])
-                            # new_container = torch.cat([part_before, part_after, new_node_tensor])
-                            
-                            # 3. 更新环境中的数据
+                            new_container = torch.cat([part_before, part_after, new_node_tensor]) 
                             envs._td['topk_acts'][0] = new_container
                             
-                            # 4. 更新目标索引指向新插入的位置
-                            target_idx = len(part_before)
+                            target_idx = len(acts_container) - 1 
                             target_cand = swap_opt_item
-
-                        # -------------------------------------------------
-                        # 情况 2: Python List 处理
-                        # -------------------------------------------------
-                        elif isinstance(acts_container, list):
-                            # 1. 弹出指定位置的元素 (Remove)
-                            acts_container.pop(swap_idx)
                             
-                            # 2. 追加新元素到末尾 (Append)
-                            acts_container.append(swap_opt_item)
-                            
-                            # 3. 更新目标索引
-                            target_idx = len(part_before)
-                            target_cand = swap_opt_item
+                            candidates_list.pop(swap_idx)
+                            candidates_list.append(int(swap_opt_item))
                         
-                        else:
-                            # 兜底：如果是 Dict 或其他类型，暂时无法处理顺序注入
-                            pass
                         global COUNT
                         COUNT += 1
                         print(f"Count: {COUNT}")
-                        obs = build_obs_flp(envs._td,1, given_topk_acts= [acts_container], image_obs=True)
+                        obs = build_obs_flp(envs._td,1, given_topk_acts= [envs._td['topk_acts'][0]], image_obs=True)
                         obs_text = obs[0]['text']
                         img = obs[0]['image']
                 
                 # --- F. 生成 Label (Action String) ---
                 if target_cand is not None and target_idx != -1:
-                    # 0->A, 1->B, ...
                     chosen_label = chr(ord('A') + target_idx)
                 else:
-                     # 兜底：如果实在没法生成（极罕见），默认选 A
                      if len(options_map) > 0:
                          chosen_label = 'A'
 
@@ -440,10 +413,17 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
         # 格式化动作字符串，例如 \boxed{A}
         action_str = f"\\boxed{{{chosen_label}}}"
         actions.append(action_str)
-        trajectory.append(action_str)
-        obs_list.append(obs_text)
-        image_list.append(img)
-        solution_tour_list.append(solution_tour)
+        
+        # Store Step Data (New Format)
+        step_record = {
+            "step_idx": i,
+            "obs": obs_text,
+            "image": img, # Base64 string
+            "trajectory": action_str,
+            "candidates": candidates_list,
+            "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
+        }
+        steps_data.append(step_record)
         
         print(f"Action: {action_str}")
         
@@ -451,19 +431,22 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
         actions, valids = co_projection_selected(actions, env_name=env_name)
         
         # 环境执行一步
-        # 关键：因为我们在步骤 E 中修改了 _td['topk_acts']，
-        # 所以这里的 step 会根据 action_str 正确映射到我们注入的 opt_item
         obs, rewards, dones, infos = envs.step(actions)
         
         dones = np.array(dones)
-        # print(f"Rewards: {rewards}")
         i += 1
         
         if dones.all():
             print("All environments done.")
             break
 
-    return obs_list, image_list, solution_tour_list, trajectory
+    # Unzip steps_data into parallel lists
+    trajectory = [s['trajectory'] for s in steps_data]
+    obs_list = [s['obs'] for s in steps_data]
+    image_list = [s['image'] for s in steps_data]
+    candidates_list = [s['candidates'] for s in steps_data]
+
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map
 
 def main():
     graph_data, routing_data = load_data()
@@ -490,7 +473,7 @@ def main():
             
         print(f"\n>>> Running Environment: {env_name}")
         data = graph_data[env_name] 
-        n = len(data)
+        n = 1#len(data)
         
         # Limit to first item for testing as per original code structure
         # Or iterate all if intended. The original code looped i in range(n)
@@ -522,13 +505,15 @@ def main():
             # Ensure generator starts from 0 for the agent loop
             generator.idx = 0
             
-            obs_list, image_list, solution_tour_list, trajectory = run_agent_loop(worker, agent, solution_tour, env_name=env_name)
+            obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour, env_name=env_name)
 
             json_container.append({
+                "node_coords": node_coords,
+                "trajectory": trajectory,
                 "obs_list": obs_list,
                 "image_list": image_list,
-                "solution_tour_list": solution_tour_list,
-                "trajectory": trajectory,
+                "candidates": candidates_list,
+                "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
             })
         
         with open(f"{env_name}_agent_output.json", "w") as f:

@@ -7,6 +7,7 @@ import re
 from types import SimpleNamespace
 from omegaconf import OmegaConf
 import ray
+import time
 
 import json
 
@@ -23,11 +24,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 
 from agent_system.environments.env_manager import make_envs
 from examples.prompt_agent.llm_agent import LLMAgent
+from examples.prompt_agent.vlm_agent import VLMAgent
 from functools import partial
 from agent_system.environments.env_package.rl4co.route_obs import build_obs_tsp
 from agent_system.environments.env_package.rl4co.route_envs import RouteWorker
 from agent_system.environments.env_manager import RouteEnvironmentManager
 from agent_system.environments.env_package.rl4co.projection import co_projection_selected
+from agent_system.environments.prompts.rl4co import RL4CO_TSP_TEMPLATE, RL4CO_TSP_TEMPLATE_COT
 
 global COUNT
 COUNT = 0
@@ -181,160 +184,34 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
     obs_list = []
     solution_tour_list = []
     image_list = []
-    candidates_list = []
     
     # =========================================================================
     # 1. 获取全局坐标 (用于计算几何距离)
     # =========================================================================
     all_coords = None
-    all_coords_map = {}
     if hasattr(envs, '_td'):
         if 'locs' in envs._td.keys():
             all_coords = envs._td['locs'][0]
         elif 'facility_locs' in envs._td.keys():
             all_coords = envs._td['facility_locs'][0]
             
-        if all_coords is not None:
-            temp_coords = all_coords
-            if isinstance(temp_coords, torch.Tensor):
-                temp_coords = temp_coords.cpu().numpy()
-            for idx, coord in enumerate(temp_coords):
-                all_coords_map[int(idx)] = coord.tolist()
-            
     tour_idx = 0
     i = 0
-    
+    avg_step_times = []
     while True:
         # print(f"\n--- Step {i+1} ---")
-        obs_text, img = obs[0]['text'], obs[0]['image']
-
         actions = []
+        obs_text, img = obs[0]['text'], obs[0]['image']
+        obs_text = RL4CO_TSP_TEMPLATE_COT.format(text_obs=obs_text)
         
-        # Parse observation
-        current_node = envs._td['current_node'][0]
-        # 注意：获取引用，以便修改
-        options_map = envs._td['topk_acts'][0]
-        
-        # Extract Candidates List for this step
-        current_candidates = []
-        if isinstance(options_map, dict):
-            current_candidates = [int(k) for k in options_map.keys()]
-        else:
-            # Tensor or Array
-            c_vals = options_map.tolist() if hasattr(options_map, 'tolist') else list(options_map)
-            current_candidates = [int(x) for x in c_vals]
-        candidates_list.append(current_candidates)
-        
-        chosen_label = "0" # Default
-        
-        if solution_tour is not None and current_node is not None:
-            # Sequential matching for Routing (TSP/CVRP)
-            try:
-                # Normalize current_node to scalar
-                c_node = current_node.item() if hasattr(current_node, 'item') else current_node
-                
-                # Check if we are on track (同步当前位置)
-                if tour_idx < len(solution_tour):
-                    expected_node = solution_tour[tour_idx]
-                    e_node = expected_node.item() if hasattr(expected_node, 'item') else expected_node
-                    
-                    if c_node != e_node:
-                        # print(f"Mismatch! Current {c_node} != Expected {e_node} (index {tour_idx})")
-                        # Recovery: scan forward
-                        future_tour = solution_tour[tour_idx:]
-                        matches = np.where(future_tour == c_node)[0]
-                        if len(matches) > 0:
-                            # print(f"Recovered: Found {c_node} at offset {matches[0]}")
-                            tour_idx += matches[0]
-                        else:
-                            # print("Lost track of tour. Continuing blindly.")
-                            pass
-                            
-                    # --- 核心逻辑：寻找下一步的目标节点 ---
-                    if tour_idx < len(solution_tour) - 1:
-                        target_node = solution_tour[tour_idx + 1]
-                        # Normalize target_node
-                        t_node = target_node.item() if hasattr(target_node, 'item') else target_node
-                        
-                        found_opt = False
-                        target_idx_in_opts = -1
-                        
-                        # A. 检查 options_map 类型并提取列表
-                        if isinstance(options_map, dict):
-                            avail_opts = list(options_map.keys())
-                        else:
-                            avail_opts = options_map.tolist() if hasattr(options_map, 'tolist') else list(options_map)
-                        
-                        # B. 在候选中查找 Target
-                        if t_node in avail_opts:
-                            target_idx_in_opts = avail_opts.index(t_node)
-                            found_opt = True
-                        
-                        # ====================================================
-                        # C. 【注入逻辑】如果没找到，且不是 Dict 类型 (Dict难改序)
-                        # ====================================================
-                        if not found_opt and not isinstance(options_map, dict):
-                            if all_coords is None:
-                                # print("Warning: Coordinates missing, cannot perform geometric injection.")
-                                pass
-                            elif len(avail_opts) > 0:
-                                # print(f"[{env_name.upper()}] Target {t_node} not in Top-K. Calculating replacement...")
-                                
-                                # 1. 随机置换最后5个中的一个
-                                num_opts = len(avail_opts)
-                                pool_size = min(5, num_opts)
-                                start_idx = num_opts - pool_size
-                                swap_idx = np.random.randint(start_idx, num_opts)
-
-                                # 2. 获取 Top-K 容器引用
-                                acts_container = envs._td['topk_acts'][0]
-
-                                # 3. 覆盖 (Overwrite)
-                                acts_container[swap_idx] = t_node
-                                target_idx_in_opts = swap_idx
-
-                                found_opt = True
-                                global COUNT
-                                COUNT += 1
-                                print(f"COUNT: {COUNT}")  
-                                print("old obs:", obs_text)                                  
-                                obs_new = build_obs_tsp(envs._td, 1, trajectory=envs.actions,given_topk_acts=[acts_container], image_obs=True)
-                                obs_text = obs_new[0]['text']
-                                img = obs_new[0]['image']
-                                print("new obs:", obs_text)
-                            
-
-                        # D. 生成 Label
-                        if found_opt:
-                            if isinstance(options_map, dict):
-                                chosen_label = options_map[t_node]
-                            else:
-                                chosen_label = chr(ord('A') + target_idx_in_opts)
-                            
-                            # print(f"Planned move: {t_node} -> Option {chosen_label}")
-                            tour_idx += 1 
-                        else:
-                             # print(f"Target node {t_node} NOT in options! Available: {avail_opts}")
-                             # Fallback: Pick first option
-                             if isinstance(options_map, dict) and options_map:
-                                 chosen_label = list(options_map.values())[0]
-                             elif not isinstance(options_map, dict) and len(options_map) > 0:
-                                 chosen_label = 'A'
-                        
-                    else:
-                        # print("At end of tour.")
-                        chosen_label = "0"
-                else:
-                     # print("Tour index out of bounds.")
-                     pass
-            except Exception as e:
-                print(f"Error following tour: {e}")
-                traceback.print_exc()
-                chosen_label = "0"
-        
-        # Format action for projection
-        action_str = f"\\boxed{{{chosen_label}}}"
+        start_time = time.time()
+        action_str = agent.generate(obs_text, img, max_tokens=128)
+        end_time = time.time()
+        print(f"Agent generation time: {end_time - start_time:.4f}s")
+        avg_step_times.append(end_time - start_time)
+        print(obs_text)
         print(f"Action: {action_str}")
+
         actions.append(action_str)
         trajectory.append(action_str)
         obs_list.append(obs_text)
@@ -351,18 +228,20 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
         if dones.all():
             # print("All environments done.")
             break
-            
-    return obs_list, image_list, trajectory, candidates_list, all_coords_map
+    print(f"Total steps: {i}")
+    print(f"Average step time: {np.mean(avg_step_times):.4f}s")
+
+    return obs_list, image_list, solution_tour_list, trajectory
 
 def main():
     _, routing_data = load_data()
     
     # Configuration
-    api_key = "sk-saxqqtlyqrpconxlgcslqhrgvhwnfmuhnimiyzfvpcxqgmkh"
-    agent = LLMAgent(
+    api_key = "token-abc123456"
+    agent = VLMAgent(
         api_key=api_key,
-        api_base_url="https://api.siliconflow.cn/v1",
-        model_name="Qwen/Qwen2.5-7B-Instruct"
+        api_base_url="http://localhost:8000/v1",
+        model_name="vlm"
     )
 
     print("\n" + "="*50)
@@ -403,16 +282,9 @@ def main():
         # Ensure generator starts from 0 for the agent loop
         generator.idx = 0
         
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour, env_name="tsp")
+        obs_list, image_list, solution_tour_list, trajectory = run_agent_loop(worker, agent, solution_tour, env_name="tsp")
 
-        json_container.append({
-            "node_coords": node_coords,
-            "trajectory": trajectory,
-            "obs_list": obs_list,
-            "image_list": image_list,
-            "candidates": candidates_list,
-            "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
-        })
+        
     
     with open("tsp_agent_output.json", "w") as f:
         json.dump(json_container, f, indent=4, cls=NumpyEncoder)

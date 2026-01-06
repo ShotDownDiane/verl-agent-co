@@ -621,10 +621,10 @@ def build_obs_tsp(
             f"- **[New Cluster Entry]**: The nearest entry point to a SEPARATE, distinct group of nodes.\n"
             f"\n{cand_section}\n\n"
             f"### Instruction:\n"
-            f"Select the Option Label (A, B...) to visit next. \n"
-            f"Strategy Logic:\n"
-            f"1. **Clear Local**: Prioritize close neighbors to finish the current cluster.\n"
-            f"2. **Switch Cluster**: If the current cluster is finished (no close neighbors left), select a **[New Cluster Entry]** to jump to the next group."
+            # f"Select the Option Label (A, B...) to visit next. \n"
+            # f"Strategy Logic:\n"
+            # f"1. **Clear Local**: Prioritize close neighbors to finish the current cluster.\n"
+            # f"2. **Switch Cluster**: If the current cluster is finished (no close neighbors left), select a **[New Cluster Entry]** to jump to the next group."
         )
         
         if image_obs and img_b64:

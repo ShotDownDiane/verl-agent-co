@@ -1,11 +1,10 @@
-RL4CO_TSP_TEMPLATE_NO_HIS = """
+RL4CO_TSP_TEMPLATE_COT = """
 The task is to identify the shortest route that visits every city exactly once and returns to the starting city. 
 
 Each city is represented as a node with $(x, y)$ coordinates. The input provides the city coordinates, the $k$ nearest neighbors for each city, and their respective distances.Based on the provided data, determine the most logical next city to visit to minimize the total travel distance while respecting the TSP constraints.
 
 Input:
 {text_obs}
-
 Solve the problem efficiently and clearly. Think step-by-step before answering. The last line of your response should be: 'Therefore, the final answer is: \\boxed{{ANSWER}}'. where ANSWER is the ID/number of the next city.
 """
 
@@ -19,8 +18,6 @@ Based on the provided data and candidates, determine the most logical next city 
 
 Input:
 {text_obs}
-
-Which option is the best next step? 
 Response strictly in the format: "Therefore, the final answer is: \\boxed{{OPTION_LETTER}}".
 """
 

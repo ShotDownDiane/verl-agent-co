@@ -252,6 +252,7 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
     obs_list = []
     solution_tour_list = []
     image_list = []
+    candidates_list = []
     
     # =========================================================================
     # 1. 静态数据准备 (坐标 & 边列表)
@@ -259,12 +260,20 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
     
     # A. 获取全局坐标 (所有任务都需要计算几何距离)
     all_coords = None
+    all_coords_map = {}
     # 根据 tensordict 的不同 key 尝试获取
     if hasattr(envs, '_td'):
         if 'locs' in envs._td.keys():
             all_coords = envs._td['locs'][0]
         elif 'facility_locs' in envs._td.keys():
             all_coords = envs._td['facility_locs'][0]
+            
+    if all_coords is not None:
+        temp_coords = all_coords
+        if isinstance(temp_coords, torch.Tensor):
+            temp_coords = temp_coords.cpu().numpy()
+        for idx, coord in enumerate(temp_coords):
+            all_coords_map[int(idx)] = coord.tolist()
     
     # B. 获取全局边列表 (仅 STP/GSTP 需要)
     # 我们需要知道 edge_idx 到底连接了哪两个点
@@ -312,6 +321,16 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
         # 获取当前环境推荐的 Top-K 候选项 (Tensor 或 List)
         # 注意：这里获取的是引用，稍后修改它会影响环境状态
         options_map = envs._td['topk_acts'][0]
+        
+        # Extract Candidates List for this step
+        current_candidates = []
+        if isinstance(options_map, dict):
+            current_candidates = [int(k) for k in options_map.keys()]
+        else:
+            # Tensor or Array
+            c_vals = options_map.tolist() if hasattr(options_map, 'tolist') else list(options_map)
+            current_candidates = [int(x) for x in c_vals]
+        candidates_list.append(current_candidates)
         
         chosen_label = "0" # Default fallback
         
@@ -490,7 +509,7 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
             print("All environments done.")
             break
 
-    return obs_list, image_list, solution_tour_list, trajectory
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map
 
 def main():
     graph_data, routing_data = load_data()
@@ -549,13 +568,15 @@ def main():
             # Ensure generator starts from 0 for the agent loop
             generator.idx = 0
             
-            obs_list, image_list, solution_tour_list, trajectory = run_agent_loop(worker, agent, solution_tour, env_name=env_name)
+            obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour, env_name=env_name)
 
             json_container.append({
+                "node_coords": node_coords,
+                "trajectory": trajectory,
                 "obs_list": obs_list,
                 "image_list": image_list,
-                "solution_tour_list": solution_tour_list,
-                "trajectory": trajectory,
+                "candidates": candidates_list,
+                "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
             })
         
         with open(f"{env_name}_agent_output.json", "w") as f:

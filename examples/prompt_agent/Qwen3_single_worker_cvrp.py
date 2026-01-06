@@ -392,16 +392,25 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
     obs_list = []
     solution_tour_list = []
     image_list = []
+    candidates_list = []
     
     # =========================================================================
     # 1. 获取全局坐标 (用于计算几何距离)
     # =========================================================================
     all_coords = None
+    all_coords_map = {}
     if hasattr(envs, '_td'):
         if 'locs' in envs._td.keys():
             all_coords = envs._td['locs'][0]
         elif 'facility_locs' in envs._td.keys():
             all_coords = envs._td['facility_locs'][0]
+            
+        if all_coords is not None:
+            temp_coords = all_coords
+            if isinstance(temp_coords, torch.Tensor):
+                temp_coords = temp_coords.cpu().numpy()
+            for idx, coord in enumerate(temp_coords):
+                all_coords_map[int(idx)] = coord.tolist()
             
     tour_idx = 0
     i = 0
@@ -415,6 +424,16 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
         current_node = envs._td['current_node'][0]
         # 注意：获取引用，以便修改
         options_map = envs._td['topk_acts'][0]
+        
+        # Extract Candidates List for this step
+        current_candidates = []
+        if isinstance(options_map, dict):
+            current_candidates = [int(k) for k in options_map.keys()]
+        else:
+            # Tensor or Array
+            c_vals = options_map.tolist() if hasattr(options_map, 'tolist') else list(options_map)
+            current_candidates = [int(x) for x in c_vals]
+        candidates_list.append(current_candidates)
         
         chosen_label = "0" # Default
         
@@ -478,53 +497,8 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
                                 found_opt = True
                                 obs_new = build_obs_cvrp(envs._td, 1, envs.actions,given_topk_acts=[acts_container], image_obs=True)
                                 global COUNT
-                                COUNT += 1
-
-                                # # 1. 找到几何距离最近的候选点作为“替身”
-                                # t_coord = all_coords[t_node]
-                                # min_dist = float('inf')
-                                # swap_idx = -1
-                                
-                                # for k_idx, cand in enumerate(avail_opts):
-                                #     cand_val = cand.item() if hasattr(cand, 'item') else cand
-                                #     c_coord = all_coords[cand_val]
-                                    
-                                #     if isinstance(t_coord, torch.Tensor):
-                                #         dist = torch.norm(t_coord - c_coord).item()
-                                #     else:
-                                #         dist = np.linalg.norm(t_coord - c_coord)
-                                        
-                                #     if dist < min_dist:
-                                #         min_dist = dist
-                                #         swap_idx = k_idx
-                                
-                                # if swap_idx != -1:
-                                #     # print(f"Injection: Replacing Idx {swap_idx} with Target {t_node} (Dist: {min_dist:.4f})")
-                                    
-                                #     # 2. 获取 Top-K 容器引用
-                                #     acts_container = envs._td['topk_acts'][0]
-                                #     last_idx = len(avail_opts) - 1
-                                    
-                                #     # 3. 覆盖 (Overwrite)
-                                #     acts_container[swap_idx] = t_node
-                                    
-                                #     # 4. 交换至末尾 (Swap to Last)
-                                #     if swap_idx != last_idx:
-                                #         # Clone values to avoid reference issues
-                                #         val_at_last = acts_container[last_idx].clone() if hasattr(acts_container[last_idx], 'clone') else acts_container[last_idx]
-                                #         val_at_swap = acts_container[swap_idx].clone() if hasattr(acts_container[swap_idx], 'clone') else acts_container[swap_idx]
-                                        
-                                #         # Swap values in TensorDict
-                                #         acts_container[last_idx] = val_at_swap
-                                #         acts_container[swap_idx] = val_at_last
-                                        
-                                #         target_idx_in_opts = last_idx
-                                #         # print(f"Swapped injected node to last position (Idx {last_idx}).")
-                                #     else:
-                                #         target_idx_in_opts = swap_idx
-                                    
-
-                                    
+                                COUNT += 1     
+                                print(f"error {COUNT}")
 
                         # D. 生成 Label
                         if found_opt:
@@ -573,7 +547,7 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
             # print("All environments done.")
             break
 
-    return obs_list, image_list, solution_tour_list, trajectory
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map
 
 def main():
     _, routing_data = load_data()
@@ -624,13 +598,15 @@ def main():
         # Ensure generator starts from 0 for the agent loop
         generator.idx = 0
         
-        obs_list, image_list, solution_tour_list, trajectory = run_agent_loop(worker, agent, solution_tour)
+        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour)
 
         json_container.append({
+            "node_coords": node_coords,
+            "trajectory": trajectory,
             "obs_list": obs_list,
             "image_list": image_list,
-            "solution_tour_list": solution_tour_list,
-            "trajectory": trajectory,
+            "candidates": candidates_list,
+            "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
         })
     
     with open("cvrp_agent_output.json", "w") as f:

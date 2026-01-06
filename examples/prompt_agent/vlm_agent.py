@@ -220,6 +220,7 @@ class VLMAgent:
     
     def generate(
         self,
+        system_prompt: str,
         text: str,
         image: Optional[Union[str, Image.Image, bytes]] = None,
         max_tokens: int = 512,
@@ -229,6 +230,7 @@ class VLMAgent:
         生成文本（支持文本和图片输入）
         
         Args:
+            system_prompt: 系统提示
             text: 输入文本提示
             image: 输入图片（可以是文件路径、PIL Image、bytes 或 base64 字符串）
             max_tokens: 最大生成 token 数
@@ -240,11 +242,11 @@ class VLMAgent:
         start_time = time.time()
         
         if self.mode == 'api':
-            result = self._generate_with_api(text, image, max_tokens, temperature)
+            result = self._generate_with_api(system_prompt, text, image, max_tokens, temperature)
         elif self.mode == 'vllm':
-            result = self._generate_with_vllm(text, image, max_tokens, temperature)
+            result = self._generate_with_vllm(system_prompt, text, image, max_tokens, temperature)
         elif self.mode == 'transformers':
-            result = self._generate_with_transformers(text, image, max_tokens, temperature)
+            result = self._generate_with_transformers(system_prompt, text, image, max_tokens, temperature)
         else:
             raise RuntimeError("Model not initialized")
         
@@ -255,6 +257,7 @@ class VLMAgent:
     
     def _generate_with_api(
         self,
+        system_prompt: str,
         text: str,
         image: Optional[Union[str, Image.Image, bytes]] = None,
         max_tokens: int = 512,
@@ -281,6 +284,8 @@ class VLMAgent:
             # 只有文本
             content = text
         
+        # 添加系统提示
+        messages.append({"role": "system", "content": system_prompt})   
         messages.append({"role": "user", "content": content})
         
         # 调用 API（统一入口，兼容多种客户端）
@@ -304,6 +309,7 @@ class VLMAgent:
     
     def _generate_with_vllm(
         self,
+        system_prompt: str,
         text: str,
         image: Optional[Union[str, Image.Image, bytes]] = None,
         max_tokens: int = 512,
@@ -329,6 +335,7 @@ class VLMAgent:
     
     def _generate_with_transformers(
         self,
+        system_prompt: str,
         text: str,
         image: Optional[Union[str, Image.Image, bytes]] = None,
         max_tokens: int = 512,
