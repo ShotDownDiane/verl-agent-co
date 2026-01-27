@@ -11,6 +11,9 @@
 **/playground
 **/wandb
 **/*.json
+**/*.pth
+checkpoint/
+examples/prompt_agent/cot/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
