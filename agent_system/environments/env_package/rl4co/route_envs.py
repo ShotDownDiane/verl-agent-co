@@ -13,10 +13,9 @@ from tensordict.tensordict import TensorDict
 from rl4co.envs.routing.tsp.env import TSPEnv
 from rl4co.envs.routing.cvrp.env import CVRPEnv
 from rl4co.envs.routing.op.env import OPEnv
-from rl4co.envs.routing.tdtsp.env import TDTSPMatrixEnv
-from rl4co.envs.routing.tdtsp.env_tw import TDTSPTWEnv, TDTSPTWGenerator
-from rl4co.envs.routing.tdvrp.env import TDVRPEnv
-from rl4co.envs.routing.lrp.env import LRPEnv
+from env.tdtsp.env import TDTSPMatrixEnv
+from env.tdtsp.env_tw import TDTSPTWEnv, TDTSPTWGenerator
+from env.tdvrp.env import TDVRPEnv
 
 from .base_env import BaseCOWorker, BaseCOEnvs
 from .route_obs import (
@@ -25,8 +24,7 @@ from .route_obs import (
     build_obs_op,
     build_obs_tdtsp,
     build_obs_tdtsp_tw,
-    build_obs_tdvrp,
-    build_obs_lrp
+    build_obs_tdvrp
 )
 
 class RouteWorker(BaseCOWorker):
@@ -43,7 +41,6 @@ class RouteWorker(BaseCOWorker):
         'tdtsp': {'cls': TDTSPMatrixEnv, 'builder': build_obs_tdtsp},
         'tdtsp_tw': {'cls': TDTSPTWEnv, 'builder': build_obs_tdtsp_tw},
         'tdvrp': {'cls': TDVRPEnv, 'builder': build_obs_tdvrp},
-        'lrp': {'cls': LRPEnv, 'builder': build_obs_lrp},
     }
 
     def __init__(
@@ -96,6 +93,8 @@ class RouteWorker(BaseCOWorker):
             matrix_path = self.env_kwargs.get("matrix_path")
             base_data_path = self.env_kwargs.get("base_data_path")
             random_sample = self.env_kwargs.get("random_sample", True)
+            instance_path = self.env_kwargs.get("instance_path", None)
+            num_nodes = self.env_kwargs.get("num_nodes", None)
             
             if env_key == 'tdtsp':
                 generator = TDTSPTWGenerator(
@@ -123,11 +122,13 @@ class RouteWorker(BaseCOWorker):
                 return env_cls(**params)
             elif env_key == 'tdvrp':
                 # TDVRP also needs specific generator setup or path-based init
-                from rl4co.envs.routing.tdvrp.generator import TDVRPGenerator
+                from env.tdvrp.generator import TDVRPGenerator
                 gen = TDVRPGenerator(
+                    # instance_path=instance_path,
                     data_path=data_path,
                     base_data_path=base_data_path,
                     matrix_path=matrix_path,
+                    num_nodes=num_nodes,
                     service_time=180.0, # Hardcoded as per requirement
                     random_sample=random_sample,
                 )
@@ -168,7 +169,6 @@ class RouteWorker(BaseCOWorker):
             for i in range(self.env_num):
                 infos[i]["cumulative_reward"] = cum_rewards[i]
                 infos[i]["total_penalty"] = total_violations[i]
-        
         return obs_list, rewards, dones, infos
 
     def _sync_instances(self, td: TensorDict) -> TensorDict:

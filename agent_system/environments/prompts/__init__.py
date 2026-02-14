@@ -13,11 +13,5 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .alfworld import *  # noqa: F401,F403
-from .webshop import *   # noqa: F401,F403
-from .sokoban import *   # noqa: F401,F403
-from .gym_cards import * # noqa: F401,F403
-from .appworld import *  # noqa: F401,F403
-from .search import *    # noqa: F401,F403
+
 from .rl4co import *     # noqa: F401,F403
-from .rl4co_scheduling import *  # noqa: F401,F403

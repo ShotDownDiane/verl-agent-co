@@ -1,3 +1,4 @@
+
 from typing import List, Optional
 import os
 import cv2
@@ -2387,10 +2388,7 @@ def build_obs_tdtsp_tw(
 ) -> list:
     """
     Observation builder for TDTSPTW (Time-Dependent + Time Windows).
-    Refactored to match the multimodal prompt design:
-    1. Task Instruction
-    2. System Status (Time, Coords, Trend, Stage, Workload)
-    3. Candidate List (Coords, Cost, Slack, Traffic, Alignment)
+    Features: Soft Constraint Handling (Valid > Late), Urgency analysis, Wait Cost visibility.
     """
     obs_list = []
     
@@ -2399,6 +2397,7 @@ def build_obs_tdtsp_tw(
     current_node = _to_numpy(td["current_node"]) 
     current_time = _to_numpy(td["current_time"]) 
     visited = _to_numpy(td.get("visited", torch.zeros_like(td["action_mask"]))) 
+    action_mask = _to_numpy(td["action_mask"]) 
     
     # TDTSPTW Specifics
     time_windows = _to_numpy(td["time_windows"])
@@ -2429,10 +2428,10 @@ def build_obs_tdtsp_tw(
         time_step_idx = int(time_val // curr_duration)
         max_s = matrix.shape[-1] - 1
         s = min(time_step_idx, max_s)
-        next_s = min(s + 1, max_s) # For traffic forecast
-
-        # Momentum & Trend Analysis
+        
+        # Momentum
         path_history = []
+        momentum_str = "None (Start)"
         if trajectory is not None and len(trajectory) > 0:
             for t_step in trajectory:
                 val = t_step[i]
@@ -2442,63 +2441,36 @@ def build_obs_tdtsp_tw(
         if len(path_history) == 0 or path_history[-1] != curr_idx:
             path_history.append(curr_idx)
             
-        momentum_vec = np.array([0.0, 0.0])
-        trend_str = "Stationary"
-        routing_stage = "Starting"
-        
-        depot_pos = curr_locs[0]
-        momentum_str = "None (Start)" # Keep for backward compatibility
-        
         if len(path_history) >= 2:
             prev_idx = path_history[-2]
             prev_pos = curr_locs[prev_idx]
-            
-            # Basic Momentum String
             m_dx = curr_pos[0] - prev_pos[0]
             m_dy = curr_pos[1] - prev_pos[1]
             m_dir = get_spatial_desc(m_dx, m_dy)
             momentum_str = f"Heading {m_dir} from Node {prev_idx}"
-            
-            # Trend relative to depot
-            momentum_vec = curr_pos - prev_pos
-            vec_to_depot = depot_pos - curr_pos
-            dist_to_depot = np.linalg.norm(vec_to_depot)
-            
-            if dist_to_depot > 1e-6 and np.linalg.norm(momentum_vec) > 1e-6:
-                norm_mom = momentum_vec / np.linalg.norm(momentum_vec)
-                norm_to_depot = vec_to_depot / dist_to_depot
-                dot_prod = np.dot(norm_mom, norm_to_depot)
-                
-                if dot_prod > 0.3:
-                    trend_str = "Trending Towards Depot"
-                    routing_stage = "Returning"
-                elif dot_prod < -0.3:
-                    trend_str = "Trending Away from Depot"
-                    routing_stage = "Expanding Outward"
-                else:
-                    trend_str = "Parallel to Depot"
-                    routing_stage = "Exploring Boundary"
-            else:
-                trend_str = "Near Depot"
-                routing_stage = "Returning"
-        
+
         # 2.2 Candidate Analysis
         candidates = []
+        
+        # Get Unvisited
+        # 注意：这里我们只依赖 'unvisited' 逻辑，不再依赖 mask 里的 'valid' 逻辑
+        # 因为在全死的情况下，我们需要捡回那些被 mask 掉的点
+        # 通常 mask = unvisited & valid。如果全 invalid，mask 可能全 0。
+        # 为了鲁棒性，我们直接找 visited == 0 的点。
         unvisited_indices = np.where(visited[i] == 0)[0] 
         unvisited_indices = unvisited_indices[unvisited_indices != curr_idx]
         
         # Extract Travel Times
         if matrix.dim() == 4:
             tt_slice = matrix[i, curr_idx, :, s]
-            tt_next_slice = matrix[i, curr_idx, :, next_s]
         else:
             tt_slice = matrix[curr_idx, :, s]
-            tt_next_slice = matrix[curr_idx, :, next_s]
-            
         if hasattr(tt_slice, 'cpu'): tt_slice = tt_slice.cpu().numpy()
-        if hasattr(tt_next_slice, 'cpu'): tt_next_slice = tt_next_slice.cpu().numpy()
         
-        # Strategy
+        # 这里需要注意索引对齐，unvisited_tt 需要对应 unvisited_indices
+        unvisited_tt = tt_slice[unvisited_indices]
+
+        # Branch A: SFT Injection
         if given_topk_acts is not None:
             indices = given_topk_acts[i]
             target_indices = [int(x) for x in indices if x != -1]
@@ -2507,95 +2479,108 @@ def build_obs_tdtsp_tw(
             target_indices = unvisited_indices
             strategy_tag = "greedy"
 
+        # Calculate Detailed Metrics for ALL potential candidates (Soft Filter)
         temp_candidates = []
         for j, idx_val in enumerate(target_indices):
             uid = int(idx_val)
-            cand_pos = curr_locs[uid]
             
-            # (i) Coordinates: Map to [0, 224]
-            int_x = int(cand_pos[0] * 224)
-            int_y = int(cand_pos[1] * 224)
-            
-            # (ii) Cost Metrics
-            dist_val = np.linalg.norm(cand_pos - curr_pos)
-            
-            # Robust TT retrieval
-            tt = float(tt_slice[uid])
-            tt_next = float(tt_next_slice[uid])
-            
-            # (iv) Traffic Feature
-            traffic_increasing = tt_next > tt * 1.05
-            traffic_cue = "Increasing" if traffic_increasing else "Stable"
+            # Physics
+            dist_val = np.linalg.norm(curr_locs[uid] - curr_pos)
             
             # Time & Window
-            tw = time_windows[i, uid]
+            try:
+                # 如果是 Greedy 模式，直接用切片；如果是 SFT，可能需要查表
+                if strategy_tag == "greedy":
+                    tt = float(unvisited_tt[j])
+                else:
+                    tt = float(tt_slice[uid])
+            except:
+                tt = 9999.0 
+
+            tw = time_windows[i, uid] # [start, end]
             tw_start, tw_end = float(tw[0]), float(tw[1])
             
             arrival_time = time_val + tt
             wait_time = max(0.0, tw_start - arrival_time)
+            
             start_time = max(arrival_time, tw_start)
             is_late = start_time > tw_end
-            
-            # (iii) Slack Time
             slack = tw_end - start_time
             
-            # Traffic Risk
-            if traffic_increasing and (time_val + tt_next > tw_end):
-                traffic_cue = "Risk"
-
-            # (v) Trajectory Alignment
-            vec_cand = cand_pos - curr_pos
-            alignment = "Neutral"
-            if np.linalg.norm(vec_cand) > 1e-6 and np.linalg.norm(momentum_vec) > 1e-6:
-                norm_cand = vec_cand / np.linalg.norm(vec_cand)
-                norm_mom = momentum_vec / np.linalg.norm(momentum_vec)
-                align_score = np.dot(norm_cand, norm_mom)
-                if align_score > 0.4:
-                    alignment = "Forward"
-                elif align_score < -0.4:
-                    alignment = "Backward"
-                else:
-                    alignment = "Sideways"
-
+            # [MODIFIED] Always append, do not filter out 'is_late' here.
+            # We filter/sort later.
             temp_candidates.append({
                 'id': uid,
-                'int_coords': (int_x, int_y),
                 'dist': dist_val,
                 'tt': tt,
                 'wait': wait_time,
                 'eta': arrival_time,
                 'slack': slack,
-                'traffic': traffic_cue,
-                'alignment': alignment,
                 'tw_end': tw_end,
                 'is_late': is_late,
-                'x': cand_pos[0],
-                'y': cand_pos[1],
+                'x': curr_locs[uid][0],
+                'y': curr_locs[uid][1],
                 'strategy': strategy_tag
             })
 
-        # --- 2.3 Sorting & Selection ---
+        # --- 2.3 Sorting & Selection (Hybrid Strategy) ---
         if given_topk_acts is None:
+            # 排序逻辑：
+            # 1. 核心目标：在保证不造成新的 Late (is_late=False) 的前提下，优先满足紧迫需求 (Small Slack)。
+            # 2. 次要目标：合并考虑效率 (Efficiency)，减少路程和等待。
+            # 3. 紧迫度采用分段式 Bonus (奖励) 机制，从 Efficiency 中扣除：
+            #    - Slack >= 600 (宽裕): Bonus = 0. 按照 Efficiency 排序。
+            #    - 300 <= Slack < 600 (关注): Bonus 线性增长。
+            #    - Slack < 300 (非常紧迫): Bonus 极大 (Offset + Slope)，确保 Score 为负值，强制排在前面。
+
             def calculate_score(c):
+                # 提取基础数据
                 travel_time = c['tt']
                 wait_time = c['wait']
                 slack = c['slack']
-                PANIC_THRESHOLD = 1200.0
-                URGENT_THRESHOLD = 2400.0
+                
+                # 定义阈值 (单位: 秒)
+                # PANIC_THRESHOLD: 低于这个值，说明必须马上出发，否则来不及
+                # 设定逻辑：大约等于平均 travel_time * 1.5，或者直接设为 10-15 分钟
+                PANIC_THRESHOLD = 1200.0   # < 20 min: 恐慌区 (生死存亡)
+                URGENT_THRESHOLD = 2400.0 # < 40 min: 紧急区 (兼顾效率与紧迫)
+                
+                # --- 层级 1: 恐慌区 (Panic Zone) ---
+                # 逻辑：只要 Slack 极小，完全不看距离远近，谁 Slack 最小谁排最前 (EDD规则)
                 if slack < PANIC_THRESHOLD:
+                    # 使用一个巨大的负数 Offset，确保它们永远排在 Urgent/Safe 节点之前
+                    # 这里的 Score 只由 slack 决定。Slack 越小，Score 越负 (越小)
+                    # 注意：这里移除了 travel_time，防止因为距离远而放弃救援
                     return -1000000.0 + slack 
+
+                # --- 层级 2: 紧急区 (Urgent Zone) ---
+                # 逻辑：虽然急，但还有喘息机会。此时需要平衡“距离”和“紧迫度”。
+                # 我们希望：距离越短越好，Slack 越大越好(意味着越不急)
+                # Score = Distance + Penalty(Slack)
                 elif slack < URGENT_THRESHOLD:
+                    # 这是一个指数型惩罚，随着 slack 变小，惩罚急剧增加
+                    # 比线性奖励更平滑，且在接近 PANIC 区时会有极强的吸力
                     urgency_weight = 1000.0 * (1.0 - (slack / URGENT_THRESHOLD))
-                    return (travel_time + wait_time) - urgency_weight - 50000.0
+                    return (travel_time + wait_time) - urgency_weight - 50000.0 # Offset 确保排在 Safe 之前
+
+                # --- 层级 3: 安全区 (Safe Zone) ---
+                # 逻辑：时间很充裕，完全按照效率（距离/时间）决策
                 else:
+                    # 纯粹的 TSP 贪婪逻辑：找最近的
+                    # 可以加上微量的 slack 惩罚，防止一直把某个人拖到最后
                     return (travel_time + wait_time) - (slack * 0.01)
 
+            # 排序逻辑保持不变
             candidates = sorted(temp_candidates, key=lambda x: (
-                x['is_late'],           
-                calculate_score(x)      
+                x['is_late'],           # 1. 死的放最后
+                calculate_score(x)      # 2. Score 越小越好
             ))
+
+            
+            # 取 Top-K
             candidates = candidates[:top_k]
             
+            # Save Acts
             sorted_indices = [c['id'] for c in candidates]
             valid_len = len(sorted_indices)
             padded = np.array(sorted_indices + [-1]*(top_k - valid_len))
@@ -2603,54 +2588,73 @@ def build_obs_tdtsp_tw(
         else:
             candidates = temp_candidates
 
-        # --- 2.4 Text Generation (Refactored) ---
-        
-        # 1. Task Instruction
-        instruction_section = (
-            "\\noindent\\emph{1. Task Instruction.}\n"
-            "To standardize the agent's behavior, we wrap the input with a system instruction defining its role as a constrained expert solver and a strict output template.\n"
-            "This setup enforces an OTD reasoning structure, ensuring the model adheres to hard constraints and concludes with a clear boxed action."
-        )
-
-        # 2. System Status
-        status_section = (
-            "\\noindent\\emph{2. System Status.}\n"
-            "Following the instruction, the system status block summarizes the agent's current state.\n"
-            f"Simulation Time: {time_val:.2f} | Agent Coordinates: ({int(curr_pos[0]*224)}, {int(curr_pos[1]*224)})\n"
-            f"Movement Trend: {trend_str} ({routing_stage})\n"
-            f"Unvisited Nodes: {len(unvisited_indices)}"
-        )
-        
-        # 3. Candidate List
+        # --- 2.4 Text Generation (Rich Semantics with LATE Handling) ---
         cand_str_list = []
         for rank, cand in enumerate(candidates):
             label = chr(65 + rank) if rank < 26 else f"Opt{rank}"
             
-            # Format: ID, Coordinates, Cost, Slack, Traffic, Alignment
-            line = (
-                f"Option {label} [Node {cand['id']}]: "
-                f"Coordinates ({cand['int_coords'][0]}, {cand['int_coords'][1]}) | "
-                f"Cost: Travel {cand['tt']:.1f}, ETA {cand['eta']:.1f} | "
-                f"Slack: {cand['slack']:.1f} | "
-                f"Traffic: {cand['traffic']} | "
-                f"Alignment: {cand['alignment']}"
-            )
-            if cand['is_late']:
-                line += " **[VIOLATION]**"
-            cand_str_list.append(line)
+            # Spatial Vector
+            dx = cand['x'] - curr_pos[0]
+            dy = cand['y'] - curr_pos[1]
+            bearing = get_spatial_desc(dx, dy)
             
-        cand_section_text = "\\noindent\\emph{3. Candidate List.}\n" + "\n".join(cand_str_list)
+            # Status Logic
+            status_tags = []
+            
+            if cand['is_late']:
+                # [NEW] Explicit Late Tag
+                status_tags.append("**[LATE / PENALTY]**")
+            else:
+                # Normal Logic
+                if cand['slack'] < 300: 
+                    status_tags.append("**[URGENT]**")
+                
+                if cand['wait'] > cand['tt']: 
+                    status_tags.append("(Long Wait)")
+                elif cand['wait'] > 0:
+                    status_tags.append("(Wait)")
+                else:
+                    status_tags.append("(Ready)")
+                
+            status_str = " ".join(status_tags)
+            
+            # Formatting
+            cand_str_list.append(
+                f"Option {label} [Node {cand['id']}]: "
+                f"Dist: {cand['dist']*100:.1f} | "
+                f"Cost: Travel {cand['tt']:.1f} + Wait {cand['wait']:.1f} | "
+                f"Slack: {cand['slack']:.1f} {status_str} | "
+                f"Vec: [{dx:+.2f}, {dy:+.2f}] ({bearing})"
+            )
+            
+        cand_section = "\n".join(cand_str_list)
+        remaining = len(unvisited_indices)
 
-        obs_text = f"{instruction_section}\n\n{status_section}\n\n{cand_section_text}\n\n\\noindent\\emph{{Decision.}}"
-        
-        # Legacy Status String
-        status_str_legacy = (
+        obs_text = (
+            f"### Task: TDTSP with Time Windows (TDTSPTW)\n"
             f"Step: {len(path_history)}\n"
-            f"Status: Node {curr_idx}, Unvisited {len(unvisited_indices)}\n"
+            f"Status: Current Node {curr_idx}, Unvisited {remaining}\n"
+            f"Time: {time_val:.1f}\n"
+            f"Momentum: {momentum_str}\n"
+            f"History: {path_history[-10:]}\n\n"
+            f"### Visual Legend (Image Reference):\n"
+            f"- **Green Border**: Fast Route / Ready.\n"
+            f"- **Red Border**: Congested / **[LATE]** / **[URGENT]**.\n"
+            f"- **Orange Border**: Waiting Required.\n\n"
+            f"### Candidate Options:\n"
+            f"Prioritize Valid nodes. Avoid **[LATE]** nodes unless no other choice.\n"
+            f"\n{cand_section}\n\n"
+            f"### Instruction:\n"
+            f"Select the Option Label (A, B...) to visit next."
+        )
+
+        status_str = (
+            f"Step: {len(path_history)}\n"
+            f"Status: Node {curr_idx}, Unvisited {remaining}\n"
             f"Time: {time_val:.1f}\n"
             f"Momentum: {momentum_str}\n"
         )
-
+        
         # --- 2.5 Visualizer ---
         image_save_path = None
         if image_obs == "path":
@@ -2659,6 +2663,8 @@ def build_obs_tdtsp_tw(
             os.makedirs(image_save_dir, exist_ok=True)
             image_save_path = f"{image_save_dir}env{i}_step{len(path_history):03d}_{uid}.png"
         
+        # render 函数内部已经处理了 is_late=True 显示红色边框的逻辑
+        # 只要传入的 candidates 里包含 is_late 字段即可
         img_b64, image_rgb_np = render_tdtsptw_smart_dual_view(
             locs=curr_locs,
             visited_mask=(visited[i]==1),
@@ -2673,8 +2679,8 @@ def build_obs_tdtsp_tw(
         # --- 2.6 Return ---
         obs_item = {
             "text": obs_text, 
-            "obs": status_str_legacy, 
-            "candidates": cand_section_text
+            "obs": status_str, 
+            "candidates": cand_section
         }
         
         if image_obs == "base64":
@@ -2696,125 +2702,247 @@ def build_obs_tdtsp_tw(
 
 def render_tdtsptw_smart_dual_view(
     locs, visited_mask, current_node_idx, path_history, top_candidates, 
-    current_time, time_windows, img_height=224, debug_save_path=None
+    current_time, time_windows, img_height=336, debug_save_path=None
 ):
     """
-    Render a single 224x224 global map for the multimodal prompt.
-    Layers:
-    1. Global Geometry (Depot, Visited, Unvisited, Current)
-    2. Trajectory (History)
-    3. Candidates (Labeled A, B, C...)
+    TDTSPTW 智能双视图渲染 (Clean Semantic Style - No Numbers).
+    
+    Changes:
+    - Removed numerical TW text from base nodes.
+    - Removed numerical Slack/Wait values from candidate labels.
+    - Labels now show semantic tags only: "URGENT", "Wait", "Ready".
     """
-    # Force 224x224 as requested
-    img_size = 224
-    canvas = np.ones((img_size, img_size, 3), dtype=np.uint8) * 255
-    
-    # --- 1. Coordinate Transform ---
-    # Disperse to minimize overlap
     locs = disperse_locations_global(locs)
+    # --- 1. 配色方案 (BGR) ---
+    COLOR_BG = (255, 255, 255)
     
-    # Map to [0, 224] and Flip Y (to align with Cartesian North=Up)
-    # x_pix = x * W
-    # y_pix = H - y * H
-    pts = np.zeros_like(locs, dtype=np.int32)
-    pts[:, 0] = (locs[:, 0] * img_size).astype(np.int32)
-    pts[:, 1] = img_size - (locs[:, 1] * img_size).astype(np.int32)
+    # 节点基础色
+    COLOR_CURRENT_FILL = (220, 100, 50)    # Royal Blue
+    COLOR_UNVISITED = (34, 34, 200)        # Deep Red
+    COLOR_VISITED = (220, 220, 220)        # Light Grey
     
-    # Clamp to be safe
-    pts = np.clip(pts, 0, img_size - 1)
+    # 状态语义色 (Border Colors) - Aligned with Text Obs
+    COLOR_TW_URGENT = (0, 0, 255)          # Red (Low Slack / Late)
+    COLOR_TW_WAIT = (0, 165, 255)          # Orange (Wait)
+    COLOR_TW_READY = (50, 200, 50)         # Green (Safe/Ready)
+    
+    # 辅助色
+    COLOR_TEXT = (10, 10, 10)
+    COLOR_ZOOM_BOX = (0, 0, 255)
+    COLOR_BORDER = (180, 180, 180)
 
-    # --- Colors (BGR) ---
-    COLOR_DEPOT = (0, 0, 0)        # Black Square
-    COLOR_VISITED = (200, 200, 200) # Light Grey
-    COLOR_UNVISITED = (180, 180, 180) # Grey (Default) - Wait, description says "different colors"
-    # Let's use:
-    # Depot: Black/Distinct
-    # Visited: Light Grey
-    # Unvisited: Blueish/Reddish? 
-    # Current: Blue
+    # 画布初始化
+    img_width = img_height * 2 
+    combined_canvas = np.ones((img_height, img_width, 3), dtype=np.uint8) * 255
     
-    COLOR_UNVISITED_NODE = (100, 100, 100) # Darker Grey for normal nodes
-    COLOR_CURRENT = (255, 0, 0) # Blue (BGR)
-    COLOR_CANDIDATE = (0, 0, 255) # Red for Candidates?
-    
-    # --- Layer 2: Trajectory ---
-    if len(path_history) > 1:
-        hist_pts = pts[path_history]
-        # Draw connected path
-        cv2.polylines(canvas, [hist_pts], isClosed=False, color=(200, 200, 200), thickness=2, lineType=cv2.LINE_AA)
+    left_roi = combined_canvas[:, :img_height] 
+    right_roi = combined_canvas[:, img_height:]
+
+    # --- 2. 坐标变换逻辑 ---
+    def get_transform(center, span, output_size, padding=40):
+        half_span = span / 2.0
+        min_xy = center - half_span
+        max_xy = center + half_span
+        available_size = output_size - 2 * padding
+        scale = available_size / max(span, 1e-6)
+        canvas_center = output_size / 2.0
         
-        # Optional: Gradient or Direction arrows? 
-        # Description says "connected path". Keep it simple.
+        def transform_fn(coords):
+            coords = np.array(coords)
+            centered = coords - center
+            scaled = centered * scale
+            final = scaled.copy()
+            final[..., 0] += canvas_center
+            final[..., 1] = canvas_center - final[..., 1] 
+            return final.astype(int)
+        return transform_fn, (min_xy, max_xy)
+
+    # --- 3. 全局视图计算 ---
+    g_min = np.min(locs, axis=0)
+    g_max = np.max(locs, axis=0)
+    g_center = (g_min + g_max) / 2.0
+    g_span = np.max(g_max - g_min)
+    global_transform, _ = get_transform(g_center, g_span, img_height, padding=60)
+
+    # --- 4. 智能聚焦逻辑 ---
+    curr_pos = locs[current_node_idx]
+    if top_candidates:
+        cand_coords = np.array([[c['x'], c['y']] for c in top_candidates])
+        dists = np.linalg.norm(cand_coords - curr_pos, axis=1)
+        max_dist = np.max(dists)
+        zoom_span = max(max_dist * 2.5, g_span * 0.05)
+        zoom_span = min(zoom_span, g_span * 0.5)
+    else:
+        zoom_span = g_span * 0.2
+    zoom_transform, (z_real_min, z_real_max) = get_transform(curr_pos, zoom_span, img_height, padding=40)
+
+    # --- 5. 绘图函数 ---
+    def draw_scene(canvas, transform_fn, view_bounds=None, is_zoomed=False):
+        pts = transform_fn(locs)
         
-    # --- Layer 1: Global Geometry (Nodes) ---
-    # Draw all nodes first
-    for i in range(len(locs)):
-        pt = tuple(pts[i])
-        radius = 3
-        
-        if i == 0: # Depot
-            cv2.rectangle(canvas, (pt[0]-4, pt[1]-4), (pt[0]+4, pt[1]+4), (0, 0, 0), -1, cv2.LINE_AA)
-            continue
+        # === Layer 1: Gradient Path History ===
+        if len(path_history) > 1:
+            hist_to_draw = path_history if not is_zoomed else path_history[-15:]
+            hist_pts = pts[hist_to_draw]
+            num_segments = len(hist_pts) - 1
+            for i in range(num_segments):
+                pt_a = tuple(hist_pts[i])
+                pt_b = tuple(hist_pts[i+1])
+                ratio = i / max(num_segments, 1)
+                gray_val = int(230 - (150 * ratio)) 
+                color = (gray_val, gray_val, gray_val)
+                thickness = 3 if is_zoomed else 2
+                cv2.line(canvas, pt_a, pt_b, color, thickness, cv2.LINE_AA)
+
+        # === Layer 2: Base Nodes (No Numbers) ===
+        node_radius = 6 if is_zoomed else 4
+        for i in range(len(locs)):
+            pt = tuple(pts[i])
+            # Skip Current & Candidates
+            is_candidate = False
+            for c in top_candidates:
+                if c['id'] == i: is_candidate = True; break
             
-        if i == current_node_idx:
-            continue # Draw later
+            if i == current_node_idx or is_candidate:
+                continue
             
-        # Check if candidate
-        is_candidate = False
-        for c in top_candidates:
-            if c['id'] == i: is_candidate = True; break
+            if visited_mask[i]:
+                cv2.circle(canvas, pt, node_radius, COLOR_VISITED, -1, cv2.LINE_AA)
+            else:
+                cv2.circle(canvas, pt, node_radius, COLOR_UNVISITED, -1, cv2.LINE_AA)
+                # [MODIFIED] Removed numerical TW text display
+
+        # === Layer 3: Candidates (Semantic Colors) ===
+        font_scale = 0.5 if is_zoomed else 0.4
+        label_thickness = 1
+        cand_label_box_pad = 6 if is_zoomed else 4
         
-        if is_candidate:
-            continue # Draw later
+        candidate_list = list(enumerate(top_candidates))
+        for rank, cand in reversed(candidate_list):
+            cand_idx = cand['id']
+            cand_pt = tuple(pts[cand_idx])
+            label = chr(65 + rank)
             
-        if visited_mask[i]:
-            cv2.circle(canvas, pt, radius, COLOR_VISITED, -1, cv2.LINE_AA)
-        else:
-            cv2.circle(canvas, pt, radius, COLOR_UNVISITED_NODE, -1, cv2.LINE_AA)
+            # 3.1 Draw Dot
+            cv2.circle(canvas, cand_pt, node_radius, COLOR_UNVISITED, -1, cv2.LINE_AA)
+            
+            # 3.2 Determine Status & Color
+            slack = cand.get('slack', 9999)
+            wait = cand.get('wait', 0)
+            is_late = cand.get('is_late', False)
+            
+            semantic_label = "Ready"
+            if is_late or slack < 15.0:  # URGENT / LATE
+                border_color = COLOR_TW_URGENT
+                border_width = 2
+                semantic_label = "URGENT" # Semantic Label
+            elif wait > 0:               # WAIT
+                border_color = COLOR_TW_WAIT
+                border_width = 2
+                semantic_label = "Wait"   # Semantic Label
+            else:                        # READY
+                border_color = COLOR_TW_READY
+                border_width = 2
+                semantic_label = "Ready"
+            
+            # 3.3 Label Box
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, label_thickness)
+            box_tl = (cand_pt[0] - w//2 - cand_label_box_pad, cand_pt[1] - h//2 - cand_label_box_pad)
+            box_br = (cand_pt[0] + w//2 + cand_label_box_pad, cand_pt[1] + h//2 + cand_label_box_pad)
+            
+            cv2.rectangle(canvas, box_tl, box_br, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.rectangle(canvas, box_tl, box_br, border_color, border_width, cv2.LINE_AA)
+            
+            # 3.4 Label Text
+            text_x = cand_pt[0] - w // 2
+            text_y = cand_pt[1] + h // 2
+            cv2.putText(canvas, label, (text_x, text_y), 
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, COLOR_TEXT, label_thickness, cv2.LINE_AA)
+            
+            # 3.5 [Zoom View] Show Semantic Label (No Numbers)
+            # Only show text if it's NOT just "Ready" (to keep it clean)
+            if is_zoomed and semantic_label != "Ready":
+                (cw, ch), _ = cv2.getTextSize(semantic_label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+                cx = cand_pt[0] - cw // 2
+                cy = box_br[1] + ch + 2
+                cv2.putText(canvas, semantic_label, (cx, cy), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, border_color, 1, cv2.LINE_AA)
 
-    # --- Layer 4: Current Node ---
-    curr_pt = tuple(pts[current_node_idx])
-    cv2.circle(canvas, curr_pt, 6, COLOR_CURRENT, -1, cv2.LINE_AA)
-    cv2.circle(canvas, curr_pt, 8, (255, 255, 255), 1, cv2.LINE_AA) # White border
+        # === Layer 4: Current Node ===
+        curr_pt = tuple(pts[current_node_idx])
+        curr_size = 10 if is_zoomed else 6
+        cv2.rectangle(canvas, (curr_pt[0]-curr_size-2, curr_pt[1]-curr_size-2), 
+                      (curr_pt[0]+curr_size+2, curr_pt[1]+curr_size+2), (255,255,255), -1, cv2.LINE_AA)
+        cv2.rectangle(canvas, (curr_pt[0]-curr_size, curr_pt[1]-curr_size), 
+                      (curr_pt[0]+curr_size, curr_pt[1]+curr_size), COLOR_CURRENT_FILL, -1, cv2.LINE_AA)
 
-    # --- Layer 3: Candidates ---
-    # "We annotate all candidate nodes... use the same identifiers"
-    for rank, cand in enumerate(top_candidates):
-        cand_idx = cand['id']
-        pt = tuple(pts[cand_idx])
-        label = chr(65 + rank) if rank < 26 else f"Opt{rank}"
+    # --- 6. Execute Drawing ---
+    draw_scene(left_roi, global_transform, is_zoomed=False)
+    
+    # Focus Box
+    if top_candidates:
+        box_p1 = global_transform(z_real_min)
+        box_p2 = global_transform(z_real_max)
+        x1, y1 = min(box_p1[0], box_p2[0]), min(box_p1[1], box_p2[1])
+        x2, y2 = max(box_p1[0], box_p2[0]), max(box_p1[1], box_p2[1])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img_height-1, x2), min(img_height-1, y2)
         
-        # Draw Node
-        cv2.circle(canvas, pt, 5, (0, 0, 255), -1, cv2.LINE_AA) # Red dot
-        
-        # Draw Label
-        # White box background for readability
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.5
-        thick = 1
-        (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
-        
-        # Position label slightly offset? Or centered?
-        # If overlap is minimized, centered might be okay, but offset is safer.
-        # Let's put it top-right of the node
-        tx = pt[0] + 6
-        ty = pt[1] - 6
-        
-        # Clamp text position
-        tx = min(tx, img_size - tw - 2)
-        ty = max(ty, th + 2)
-        
-        cv2.rectangle(canvas, (tx-1, ty-th-1), (tx+tw+1, ty+2), (255, 255, 255), -1)
-        cv2.putText(canvas, label, (tx, ty), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(left_roi, (x1, y1), (x2, y2), COLOR_ZOOM_BOX, 2, cv2.LINE_AA)
+            cv2.line(combined_canvas, (x2, y1), (img_height, 0), COLOR_ZOOM_BOX, 1, cv2.LINE_AA)
+            cv2.line(combined_canvas, (x2, y2), (img_height, img_height), COLOR_ZOOM_BOX, 1, cv2.LINE_AA)
 
-    # --- Output ---
-    _, buffer = cv2.imencode('.png', canvas)
+    draw_scene(right_roi, zoom_transform, view_bounds=(z_real_min, z_real_max), is_zoomed=True)
+    
+    # --- 7. Legend ---
+    def draw_legend(img):
+        start_x, start_y = 20, img_height - 20
+        line_height = 25
+        font_scale = 0.5
+        font_color = (60, 60, 60)
+        
+        def draw_item(y, text, draw_icon_fn):
+            draw_icon_fn(start_x, y - 8)
+            cv2.putText(img, text, (start_x + 25, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 1, cv2.LINE_AA)
+            return y - line_height
+
+        current_y = start_y
+        current_y = draw_item(current_y, "Current Node", lambda x, y: cv2.rectangle(img, (x-6, y-6), (x+6, y+6), COLOR_CURRENT_FILL, -1))
+        
+        # TW Legend
+        def icon_urgent(x, y):
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), (255,255,255), -1)
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), COLOR_TW_URGENT, 2)
+        current_y = draw_item(current_y, "Urgent (Low Slack)", icon_urgent)
+        
+        def icon_wait(x, y):
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), (255,255,255), -1)
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), COLOR_TW_WAIT, 2)
+        current_y = draw_item(current_y, "Waiting Required", icon_wait)
+
+        def icon_ready(x, y):
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), (255,255,255), -1)
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), COLOR_TW_READY, 2)
+        current_y = draw_item(current_y, "Ready / Safe", icon_ready)
+        
+    draw_legend(left_roi)
+    
+    # Titles & Time
+    cv2.rectangle(combined_canvas, (img_height, 0), (img_width-1, img_height-1), COLOR_BORDER, 4)
+    cv2.putText(left_roi, "Global Map", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80,80,80), 2, cv2.LINE_AA)
+    
+    cv2.putText(right_roi, "Egocentric View", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80,80,80), 2, cv2.LINE_AA)
+    cv2.putText(right_roi, f"Time: {current_time:.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 1, cv2.LINE_AA)
+
+    # --- 8. Output ---
+    _, buffer = cv2.imencode('.png', combined_canvas)
     b64_str = base64.b64encode(buffer).decode('utf-8')
-    img_rgb_np = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    img_rgb_np = cv2.cvtColor(combined_canvas, cv2.COLOR_BGR2RGB)
     
     if debug_save_path:
         os.makedirs(os.path.dirname(debug_save_path) if os.path.dirname(debug_save_path) else ".", exist_ok=True)
-        cv2.imwrite(debug_save_path, canvas)
+        cv2.imwrite(debug_save_path, combined_canvas)
     
     return b64_str, img_rgb_np
 
@@ -2829,10 +2957,7 @@ def build_obs_tdvrp(
 ) -> list:
     """
     Observation builder for TDVRPEnv (Cost + Time Window + Strategic Depot).
-    Refactored to match the multimodal prompt design:
-    1. Task Instruction
-    2. System Status (Time, Coords, Trend, Stage, Workload)
-    3. Candidate List (Coords, Cost, Slack, Traffic, Alignment)
+    Highlights: Cost breakdown (Fixed vs Labor), Urgency (Slack), and Spatial Momentum.
     """
     obs_list = []
     
@@ -2877,58 +3002,25 @@ def build_obs_tdvrp(
         time_step_idx = int(time_val // curr_duration)
         max_s = matrix.shape[-1] - 1
         s = min(time_step_idx, max_s)
-        next_s = min(s + 1, max_s) # For traffic forecast
         
-        # 2.2 Momentum & Trend Analysis
+        # 2.2 Momentum Logic (History Analysis)
         path_history = []
+        momentum_str = "None (At Depot)"
         if trajectory is not None and len(trajectory) > 0:
             for t_step in trajectory:
                 val = t_step[i]
                 if hasattr(val, 'item'): val = val.item()
                 path_history.append(int(val))
         
-        if len(path_history) == 0 or path_history[-1] != curr_idx:
-            path_history.append(curr_idx)
-
-        momentum_vec = np.array([0.0, 0.0])
-        trend_str = "Stationary"
-        routing_stage = "Starting"
-        depot_pos = curr_locs[0]
-        momentum_str = "None (At Depot)"
-
         if len(path_history) >= 2 and curr_idx != 0:
             prev_idx = path_history[-2]
             prev_pos = curr_locs[prev_idx]
-            
-            # Basic Momentum String
             m_dx = curr_pos[0] - prev_pos[0]
             m_dy = curr_pos[1] - prev_pos[1]
             m_dir = get_spatial_desc(m_dx, m_dy)
             momentum_str = f"Heading {m_dir} from Node {prev_idx}"
-            
-            # Trend relative to depot
-            momentum_vec = curr_pos - prev_pos
-            vec_to_depot = depot_pos - curr_pos
-            dist_to_depot = np.linalg.norm(vec_to_depot)
-            
-            if dist_to_depot > 1e-6 and np.linalg.norm(momentum_vec) > 1e-6:
-                norm_mom = momentum_vec / np.linalg.norm(momentum_vec)
-                norm_to_depot = vec_to_depot / dist_to_depot
-                dot_prod = np.dot(norm_mom, norm_to_depot)
-                
-                if dot_prod > 0.3:
-                    trend_str = "Trending Towards Depot"
-                    routing_stage = "Returning"
-                elif dot_prod < -0.3:
-                    trend_str = "Trending Away from Depot"
-                    routing_stage = "Expanding Outward"
-                else:
-                    trend_str = "Parallel to Depot"
-                    routing_stage = "Exploring Boundary"
         elif curr_idx == 0 and len(path_history) > 1:
             momentum_str = "Returned to Depot (Reset)"
-            trend_str = "At Depot"
-            routing_stage = "Completed/Reset"
 
         # 2.3 Candidate Generation
         candidates = []
@@ -2937,19 +3029,20 @@ def build_obs_tdvrp(
         unvisited_indices = np.where(action_mask[i] == 1)[0]
         
         # VRP Logic: Always consider Depot (0) if we are not currently there
-        # VRP Logic: Always consider Depot (0) if valid according to action_mask
-        # Note: action_mask handles validity (e.g., if we can return to depot)
+        # This allows "Early Return" strategy even if mask technically handles it
+        if curr_idx != 0:
+            if 0 not in unvisited_indices:
+                # Only add if not strictly forbidden by mask (some envs ban return until visited all)
+                # But usually for VRP "End Route" is always an option. 
+                # Let's trust the mask mostly, but ensure we don't crash if 0 is added.
+                pass
         
         # Matrix Slice
         if matrix.dim() == 4:
             tt_slice = matrix[i, curr_idx, :, s]
-            tt_next_slice = matrix[i, curr_idx, :, next_s]
         else:
             tt_slice = matrix[curr_idx, :, s]
-            tt_next_slice = matrix[curr_idx, :, next_s]
-
         if hasattr(tt_slice, 'cpu'): tt_slice = tt_slice.cpu().numpy()
-        if hasattr(tt_next_slice, 'cpu'): tt_next_slice = tt_next_slice.cpu().numpy()
 
         # Branching for SFT
         if given_topk_acts is not None:
@@ -2965,26 +3058,14 @@ def build_obs_tdvrp(
             uid = int(uid)
             if uid == curr_idx: continue
             
-            cand_pos = curr_locs[uid]
-            
-            # (i) Coordinates: Map to [0, 224]
-            int_x = int(cand_pos[0] * 224)
-            int_y = int(cand_pos[1] * 224)
-            
             # Physics
-            dist_val = np.linalg.norm(cand_pos - curr_pos)
+            dist_val = np.linalg.norm(curr_locs[uid] - curr_pos)
             
             # Time & Logic
             try:
                 tt = float(tt_slice[uid])
-                tt_next = float(tt_next_slice[uid])
             except:
                 tt = 9999.0
-                tt_next = 9999.0
-            
-            # Traffic Feature
-            traffic_increasing = tt_next > tt * 1.05
-            traffic_cue = "Increasing" if traffic_increasing else "Stable"
             
             tw = time_windows[i, uid] # [start, end]
             tw_start, tw_end = float(tw[0]), float(tw[1])
@@ -2995,7 +3076,7 @@ def build_obs_tdvrp(
             wait_time = max(0.0, tw_start - eta)
             ready_time = max(eta, tw_start)
             
-            # Cost Calculation
+            # Cost Calculation (Preserving your logic)
             # Departure includes service time ONLY for customers (uid > 0)
             departure_time = ready_time + (service_time if uid > 0 else 0.0)
             
@@ -3008,29 +3089,12 @@ def build_obs_tdvrp(
             total_cost = fixed_cost_val + labor_cost_val
             
             slack = tw_end - eta
-            
-            # Traffic Risk
-            if traffic_increasing and (time_val + tt_next > tw_end):
-                traffic_cue = "Risk"
-
-            # Alignment
-            vec_cand = cand_pos - curr_pos
-            alignment = "Neutral"
-            if np.linalg.norm(vec_cand) > 1e-6 and np.linalg.norm(momentum_vec) > 1e-6:
-                norm_cand = vec_cand / np.linalg.norm(vec_cand)
-                norm_mom = momentum_vec / np.linalg.norm(momentum_vec)
-                align_score = np.dot(norm_cand, norm_mom)
-                if align_score > 0.4:
-                    alignment = "Forward"
-                elif align_score < -0.4:
-                    alignment = "Backward"
-                else:
-                    alignment = "Sideways"
-
-            if penalty_value != 0 or not is_late: # Filter out infeasible options immediately if penalty is 0 (strict mode)
+            if penalty_value != 0 or not is_late: # Filter out infeasible options immediately
+                if is_late:
+                    print(f"Late for Node {uid}: ETA {eta:.2f} > TW End {tw_end:.2f}")
+                    
                 temp_candidates.append({
                     'id': uid,
-                    'int_coords': (int_x, int_y),
                     'dist': dist_val,
                     'tt': tt,
                     'cost': total_cost,
@@ -3039,18 +3103,16 @@ def build_obs_tdvrp(
                     'eta': eta,
                     'is_late': is_late,
                     'slack': slack,
-                    'traffic': traffic_cue,
-                    'alignment': alignment,
                     'is_depot': (uid == 0),
-                    'x': cand_pos[0],
-                    'y': cand_pos[1],
+                    'x': curr_locs[uid][0],
+                    'y': curr_locs[uid][1],
                     'strategy': strategy_tag
                 })
 
         # 2.5 Sorting
         if given_topk_acts is None:
             # Sort Strategy:
-            # 0. Extract Depot and Customers
+            # 0. 提取 Depot 和 客户
             depot_cand = None
             customer_candidates = []
             
@@ -3060,28 +3122,34 @@ def build_obs_tdvrp(
                 else:
                     customer_candidates.append(c)
             
-            # 1. Prepare two sorted lists
-            # List A: Economy Priority (Cost only)
+            # 1. 准备两个排序列表
+            # 列表 A: 经济优先 (只看钱) - 用于省成本
+            # 优先看是否迟到(0/1)，再看成本
             list_economy = sorted(customer_candidates, key=lambda x: (x.get('is_late', False), x['cost']))
             
-            # List B: Urgency Priority (Slack only)
+            # 列表 B: 紧迫优先 (只看时间) - 用于防超时
+            # 优先看是否迟到，再看截止时间(tw_end)或松弛度(slack)
+            # 注意：这里我们希望尽早去那些快过期的点
             list_urgency = sorted(customer_candidates, key=lambda x: (x.get('is_late', False), x['slack']))
             
-            # 2. Interleaved Sampling
+            # 2. 混合采样 (Interleaved Sampling)
             final_candidates = []
             seen_ids = set()
             
+            # 如果我们不在 Depot，预留 1 个位置给 Depot
+            # 如果已经在 Depot，depot_cand 可能不在 temp_candidates 里(被过滤了)，或者不需要显示
             limit = top_k
             if depot_cand and curr_idx != 0:
                 limit = top_k - 1
             
+            # 双指针交替提取
             idx_eco = 0
             idx_urg = 0
             
             while len(final_candidates) < limit:
                 added_any = False
                 
-                # [Round 1] Pick cheapest
+                # [Round 1] 取一个最便宜的
                 if idx_eco < len(list_economy):
                     cand = list_economy[idx_eco]
                     if cand['id'] not in seen_ids:
@@ -3092,7 +3160,7 @@ def build_obs_tdvrp(
                 
                 if len(final_candidates) >= limit: break
                 
-                # [Round 2] Pick most urgent
+                # [Round 2] 取一个最紧急的
                 if idx_urg < len(list_urgency):
                     cand = list_urgency[idx_urg]
                     if cand['id'] not in seen_ids:
@@ -3101,23 +3169,34 @@ def build_obs_tdvrp(
                         added_any = True
                     idx_urg += 1
                 
+                # 如果两边都遍历完了，退出
                 if not added_any and idx_eco >= len(list_economy) and idx_urg >= len(list_urgency):
                     break
             
-            # 3. Force add Depot if valid
+            # 3. 强制加入 Depot (作为最后一个选项，或保底)
             if depot_cand and curr_idx != 0:
+                # 只有当它还没被加进去的时候 (通常 Depot 不在 customer list 里，肯定没加)
                 if depot_cand['id'] not in seen_ids:
                     final_candidates.append(depot_cand)
 
-            # 4. Final Presentation Sort
+            # 4. 最终展示排序 (Presentation Sorting)
+            # 虽然选点是用混合策略，但展示给模型看的时候，建议按统一逻辑排序，方便阅读
+            # 策略：Depot 垫底，其余按 Cost 排序 (这是最直观的)
+            # 这样模型会看到：一堆按价格排序的客户（其中夹杂着很贵但很急的），最后是一个回库选项。
+            
             def presentation_sort(x):
-                if x['is_depot']: return (2, 0) # Depot last/separate
+                # 1. Depot 放最后 (rank=2)
+                if x['is_depot']: return (2, 0)
+                # 2. 迟到的放倒数第二 (rank=1)
                 if x.get('is_late', False): return (1, x['cost'])
+                # 3. 正常的放前面 (rank=0)，按 Cost 升序
                 return (0, x['cost'])
                 
             final_candidates.sort(key=presentation_sort)
+            
             candidates = final_candidates
             
+            # Save Acts for Loss Calculation
             sorted_indices = [c['id'] for c in candidates]
             valid_len = len(sorted_indices)
             padded = np.array(sorted_indices + [-1]*(top_k - valid_len))
@@ -3125,61 +3204,69 @@ def build_obs_tdvrp(
         else:
             candidates = temp_candidates
 
-        # 2.6 Text Generation (Refactored)
-        
-        # 1. Task Instruction
-        instruction_section = (
-            "\\noindent\\emph{1. Task Instruction.}\n"
-            "To standardize the agent's behavior, we wrap the input with a system instruction defining its role as a constrained expert solver and a strict output template.\n"
-            "This setup enforces an OTD reasoning structure, ensuring the model adheres to hard constraints and concludes with a clear boxed action."
-        )
-        
-        # 2. System Status
-        remaining_nodes = len(unvisited_indices)
-        if 0 in unvisited_indices: remaining_nodes -= 1
-        
-        status_section = (
-            "\\noindent\\emph{2. System Status.}\n"
-            "Following the instruction, the system status block summarizes the agent's current state.\n"
-            f"Simulation Time: {time_val:.2f} | Agent Coordinates: ({int(curr_pos[0]*224)}, {int(curr_pos[1]*224)})\n"
-            f"Movement Trend: {trend_str} ({routing_stage})\n"
-            f"Unvisited Customers: {remaining_nodes} | Costs: Fixed ${FIXED_COST} (New Trip), Labor ${PER_HOUR_COST}/hr"
-        )
-        
-        # 3. Candidate List
+        # 2.6 Text Generation
         cand_str_list = []
         for rank, cand in enumerate(candidates):
             label = chr(65 + rank) if rank < 26 else f"Opt{rank}"
             
+            dx = cand['x'] - curr_pos[0]
+            dy = cand['y'] - curr_pos[1]
+            bearing = get_spatial_desc(dx, dy)
+            
+            # Status Tags
+            tags = []
+            if cand['slack'] < 300.0: # e.g. less than 5 mins slack
+                tags.append("**[URGENT]**")
+            
+            if cand['wait'] > 600.0: # Long wait
+                tags.append("(Long Wait)")
+            elif cand['wait'] > 0:
+                tags.append(f"(Wait {cand['wait']:.0f}s)")
+            
+            tag_str = " ".join(tags)
+            
+            # Cost Formatting
+            cost_str = f"${cand['cost']:.2f}"
+            if cand['fixed'] > 0:
+                cost_str += " (New Trip)"
+            
+            # Row Generation
             if cand['is_depot']:
-                 row_str = (
-                    f"Option {label} [Node 0 **RETURN**]: "
-                    f"Coordinates ({cand['int_coords'][0]}, {cand['int_coords'][1]}) | "
-                    f"Cost: ${cand['cost']:.2f} | "
-                    f"Action: Terminate route."
+                row_str = (
+                    f"Option {label} **[RETURN TO BASE]**: "
+                    f"Cost: {cost_str} | "
+                    f"Action: Terminate route. Return to Node 0."
                 )
             else:
                 row_str = (
                     f"Option {label} [Node {cand['id']}]: "
-                    f"Coordinates ({cand['int_coords'][0]}, {cand['int_coords'][1]}) | "
-                    f"Cost: ${cand['cost']:.2f}, ETA {cand['eta']:.1f} | "
-                    f"Slack: {cand['slack']:.1f} | "
-                    f"Traffic: {cand['traffic']} | "
-                    f"Alignment: {cand['alignment']}"
+                    f"Cost: {cost_str} | "
+                    f"Slack: {cand['slack']:.0f}s {tag_str} | "
+                    f"Vec: [{dx:+.2f}, {dy:+.2f}] ({bearing})"
                 )
-            
-            if cand['is_late']:
-                row_str += " **[VIOLATION]**"
-            elif cand['slack'] < 300:
-                row_str += " **[URGENT]**"
-                
             cand_str_list.append(row_str)
             
-        cand_section_text = "\\noindent\\emph{3. Candidate List.}\n" + "\n".join(cand_str_list)
+        cand_section = "\n".join(cand_str_list)
+        
+        # Unvisited Count (excluding depot logic)
+        remaining_nodes = len(unvisited_indices)
+        if 0 in unvisited_indices: remaining_nodes -= 1
 
-        obs_text = f"{instruction_section}\n\n{status_section}\n\n{cand_section_text}\n\n\\noindent\\emph{{Decision.}}"
+        obs_text = (
+            f"### Task: TDVRP (Minimize Cost with Time Windows)\n"
+            f"Step: {len(path_history)}\n"
+            f"Status: Current Node {curr_idx}, Unvisited Customers {remaining_nodes}\n"
+            f"Time: {time_val:.1f}s\n"
+            f"Momentum: {momentum_str}\n"
+            f"Costs: Fixed ${FIXED_COST} (New Trip) | Labor ${PER_HOUR_COST}/hr\n\n"
+            f"### Candidate Options (Financial & Urgency Analysis):\n"
+            f"Goal: Visit all customers. Minimize Total Cost ($). Watch for [URGENT] slack.\n"
+            f"\n{cand_section}\n\n"
+            f"### Instruction:\n"
+            f"Select Option (A, B...) to visit next. Use [RETURN TO BASE] only if necessary."
+        )
 
-        status_str_legacy = (
+        status_str = (
             f"Step: {len(path_history)}\n"
             f"Status: Node {curr_idx}, Left {remaining_nodes}\n"
             f"Time: {time_val:.1f}s\n"
@@ -3207,8 +3294,8 @@ def build_obs_tdvrp(
         
         obs_item = {
             "text": obs_text, 
-            "obs": status_str_legacy, 
-            "candidates": cand_section_text
+            "obs": status_str, 
+            "candidates": cand_section
         }
         
         if image_obs == "base64":
@@ -3229,121 +3316,262 @@ def build_obs_tdvrp(
         
 def render_tdvrp_smart_dual_view(
     locs, visited_mask, current_node_idx, path_history, top_candidates, 
-    current_time, time_windows, img_height=224, debug_save_path=None
+    current_time, time_windows, img_height=336, debug_save_path=None
 ):
     """
-    Render a single 224x224 global map for the multimodal prompt (TDVRP).
-    Layers:
-    1. Global Geometry (Depot, Visited, Unvisited, Current)
-    2. Trajectory (History)
-    3. Candidates (Labeled A, B, C...)
+    TDVRPTW 智能双视图渲染 (Clean Semantic Style - No Numbers).
+    
+    Key Changes:
+    - Removed numerical Time Windows from base nodes in zoom view.
+    - Removed numerical Cost/Slack values from candidate labels.
+    - Candidate labels now only show semantic text (e.g., "URGENT", "Wait") or nothing if status is normal ("Ready").
+    - Relies entirely on color coding for state visualization.
     """
-    # Force 224x224
-    img_size = 224
-    canvas = np.ones((img_size, img_size, 3), dtype=np.uint8) * 255
-    
-    # --- 1. Coordinate Transform ---
     locs = disperse_locations_global(locs)
+    # --- 1. 配色方案 (BGR) ---
+    COLOR_BG = (255, 255, 255)
     
-    # Map to [0, 224] and Flip Y
-    pts = np.zeros_like(locs, dtype=np.int32)
-    pts[:, 0] = (locs[:, 0] * img_size).astype(np.int32)
-    pts[:, 1] = img_size - (locs[:, 1] * img_size).astype(np.int32)
-    pts = np.clip(pts, 0, img_size - 1)
-
-    # --- Colors (BGR) ---
-    COLOR_DEPOT = (0, 0, 0)        # Black Square
-    COLOR_VISITED = (200, 200, 200) # Light Grey
-    COLOR_UNVISITED_NODE = (100, 100, 100) # Darker Grey
-    COLOR_CURRENT = (255, 0, 0) # Blue
+    # 节点基础色
+    COLOR_DEPOT = (40, 40, 40)             # Black/Dark Grey (Base)
+    COLOR_CURRENT_FILL = (220, 100, 50)    # Royal Blue
+    COLOR_UNVISITED = (34, 34, 200)        # Deep Red
+    COLOR_VISITED = (220, 220, 220)        # Light Grey
     
-    # --- Layer 2: Trajectory ---
-    if len(path_history) > 1:
-        # TDVRP Multi-Route handling: Split by Depot (0)
-        routes = []
-        current_route_seg = []
-        for node_idx in path_history:
-            current_route_seg.append(node_idx)
-            if node_idx == 0 and len(current_route_seg) > 1:
-                routes.append(current_route_seg)
-                current_route_seg = [0]
-        if len(current_route_seg) > 1:
-            routes.append(current_route_seg)
-            
-        for route in routes:
-            hist_pts = pts[route]
-            cv2.polylines(canvas, [hist_pts], isClosed=False, color=(180, 180, 180), thickness=2, lineType=cv2.LINE_AA)
+    # 状态语义色 (Border Colors) - Aligned with Text Obs legend
+    COLOR_VRP_RETURN = (255, 0, 0)         # Blue (Return to Base)
+    COLOR_VRP_URGENT = (0, 0, 255)         # Red (Low Slack)
+    COLOR_VRP_WAIT = (0, 165, 255)         # Orange (Wait)
+    COLOR_VRP_READY = (50, 200, 50)        # Green (Ready)
+    
+    # 历史路径颜色池 (Muted Pastels)
+    ROUTE_COLORS = [
+        (180, 180, 180), (150, 150, 220), (150, 220, 150), 
+        (220, 180, 150), (200, 150, 200),
+    ]
 
-    # --- Layer 1: Global Geometry (Nodes) ---
-    for i in range(len(locs)):
-        pt = tuple(pts[i])
-        radius = 3
-        
-        if i == 0: # Depot
-            cv2.rectangle(canvas, (pt[0]-4, pt[1]-4), (pt[0]+4, pt[1]+4), (0, 0, 0), -1, cv2.LINE_AA)
-            continue
-            
-        if i == current_node_idx:
-            continue
-            
-        # Check if candidate
-        is_candidate = False
-        for c in top_candidates:
-            if c['id'] == i: is_candidate = True; break
-        
-        if is_candidate:
-            continue
-            
-        if visited_mask[i]:
-            cv2.circle(canvas, pt, radius, COLOR_VISITED, -1, cv2.LINE_AA)
-        else:
-            cv2.circle(canvas, pt, radius, COLOR_UNVISITED_NODE, -1, cv2.LINE_AA)
+    # 辅助
+    COLOR_TEXT = (10, 10, 10)
+    COLOR_ZOOM_BOX = (0, 0, 255)
+    COLOR_BORDER = (180, 180, 180)
 
-    # --- Layer 4: Current Node ---
-    curr_pt = tuple(pts[current_node_idx])
-    # Different shape for Depot if current is Depot
-    if current_node_idx == 0:
-        cv2.rectangle(canvas, (curr_pt[0]-5, curr_pt[1]-5), (curr_pt[0]+5, curr_pt[1]+5), COLOR_CURRENT, -1, cv2.LINE_AA)
-        cv2.rectangle(canvas, (curr_pt[0]-5, curr_pt[1]-5), (curr_pt[0]+5, curr_pt[1]+5), (255, 255, 255), 1, cv2.LINE_AA)
+    # 画布初始化
+    img_width = img_height * 2 
+    combined_canvas = np.ones((img_height, img_width, 3), dtype=np.uint8) * 255
+    left_roi = combined_canvas[:, :img_height] 
+    right_roi = combined_canvas[:, img_height:]
+
+    # --- 2. 坐标变换逻辑 ---
+    def get_transform(center, span, output_size, padding=40):
+        scale = (output_size - 2 * padding) / max(span, 1e-6)
+        canvas_center = output_size / 2.0
+        def transform_fn(coords):
+            coords = np.array(coords)
+            centered = coords - center
+            scaled = centered * scale
+            final = scaled.copy()
+            final[..., 0] += canvas_center
+            final[..., 1] = canvas_center - final[..., 1] 
+            return final.astype(int)
+        return transform_fn, (center - span/2, center + span/2)
+
+    # --- 3. 全局视图计算 ---
+    g_min, g_max = np.min(locs, axis=0), np.max(locs, axis=0)
+    g_center, g_span = (g_min + g_max) / 2.0, np.max(g_max - g_min)
+    global_transform, _ = get_transform(g_center, g_span, img_height, padding=60)
+
+    # --- 4. 智能聚焦逻辑 ---
+    curr_pos = locs[current_node_idx]
+    if top_candidates:
+        cand_coords = np.array([[c['x'], c['y']] for c in top_candidates])
+        dists = np.linalg.norm(cand_coords - curr_pos, axis=1)
+        max_dist = np.max(dists)
+        zoom_span = max(max_dist * 2.5, g_span * 0.05)
+        zoom_span = min(zoom_span, g_span * 0.5)
     else:
-        cv2.circle(canvas, curr_pt, 6, COLOR_CURRENT, -1, cv2.LINE_AA)
-        cv2.circle(canvas, curr_pt, 8, (255, 255, 255), 1, cv2.LINE_AA)
+        zoom_span = g_span * 0.2
+    zoom_transform, (z_real_min, z_real_max) = get_transform(curr_pos, zoom_span, img_height, padding=40)
 
-    # --- Layer 3: Candidates ---
-    for rank, cand in enumerate(top_candidates):
-        cand_idx = cand['id']
-        pt = tuple(pts[cand_idx])
-        label = chr(65 + rank) if rank < 26 else f"Opt{rank}"
+    # --- 5. 绘图函数 ---
+    def draw_scene(canvas, transform_fn, view_bounds=None, is_zoomed=False):
+        pts = transform_fn(locs)
         
-        # Draw Node (Special handling for Depot Candidate)
-        if cand_idx == 0:
-             cv2.rectangle(canvas, (pt[0]-5, pt[1]-5), (pt[0]+5, pt[1]+5), (0, 0, 255), -1, cv2.LINE_AA)
+        # === Layer 1: Multi-Route History ===
+        if len(path_history) > 1:
+            routes = []
+            current_route_seg = []
+            for node_idx in path_history:
+                current_route_seg.append(node_idx)
+                if node_idx == 0 and len(current_route_seg) > 1:
+                    routes.append(current_route_seg)
+                    current_route_seg = [0]
+            if len(current_route_seg) > 1:
+                routes.append(current_route_seg)
+            
+            for r_idx, route in enumerate(routes):
+                r_color = ROUTE_COLORS[r_idx % len(ROUTE_COLORS)]
+                hist_pts = pts[route]
+                for j in range(len(hist_pts)-1):
+                    thickness = 3 if is_zoomed else 2
+                    cv2.line(canvas, tuple(hist_pts[j]), tuple(hist_pts[j+1]), r_color, thickness, cv2.LINE_AA)
+
+        # === Layer 2: Base Nodes (Clean, No Numbers) ===
+        node_radius = 6 if is_zoomed else 4
+        for i in range(len(locs)):
+            pt = tuple(pts[i])
+            is_candidate = False
+            for c in top_candidates:
+                if c['id'] == i: is_candidate = True; break
+            
+            if i == current_node_idx or is_candidate: continue
+            
+            if i == 0: # Depot
+                d_size = node_radius + 2
+                cv2.rectangle(canvas, (pt[0]-d_size, pt[1]-d_size), (pt[0]+d_size, pt[1]+d_size), COLOR_DEPOT, -1, cv2.LINE_AA)
+            elif visited_mask[i]:
+                cv2.circle(canvas, pt, node_radius, COLOR_VISITED, -1, cv2.LINE_AA)
+            else:
+                cv2.circle(canvas, pt, node_radius, COLOR_UNVISITED, -1, cv2.LINE_AA)
+                # [MODIFIED] Removed numerical TW display in zoom view for cleanliness
+
+        # === Layer 3: Candidates (Semantic Colors & Labels only) ===
+        font_scale = 0.5 if is_zoomed else 0.4
+        label_thickness = 1
+        cand_label_box_pad = 6 if is_zoomed else 4
+        
+        candidate_list = list(enumerate(top_candidates))
+        for rank, cand in reversed(candidate_list):
+            cand_idx = cand['id']
+            cand_pt = tuple(pts[cand_idx])
+            label = chr(65 + rank)
+            
+            # 3.1 Draw Node Body
+            if cand_idx == 0:
+                d_size = node_radius + 2
+                cv2.rectangle(canvas, (cand_pt[0]-d_size, cand_pt[1]-d_size), 
+                              (cand_pt[0]+d_size, cand_pt[1]+d_size), COLOR_DEPOT, -1, cv2.LINE_AA)
+            else:
+                cv2.circle(canvas, cand_pt, node_radius, COLOR_UNVISITED, -1, cv2.LINE_AA)
+            
+            # 3.2 Determine Status & Color (Pure Semantics)
+            slack = cand.get('slack', 9999)
+            wait = cand.get('wait', 0)
+            
+            semantic_label = "" # Default empty for Ready state
+            if cand['is_depot']:
+                border_color = COLOR_VRP_RETURN
+                border_width = 2
+                semantic_label = "End Route"
+            elif slack < 300.0:  # URGENT
+                border_color = COLOR_VRP_URGENT
+                border_width = 2
+                semantic_label = "URGENT" # Replaced cost with semantic label
+            elif wait > 0:       # WAIT
+                border_color = COLOR_VRP_WAIT
+                border_width = 2
+                semantic_label = "Wait"   # Replaced cost with semantic label
+            else:                # READY
+                border_color = COLOR_VRP_READY
+                border_width = 2
+                semantic_label = "Ready"  # Will not be drawn below box
+            
+            # 3.3 Label Box
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, label_thickness)
+            box_tl = (cand_pt[0] - w//2 - cand_label_box_pad, cand_pt[1] - h//2 - cand_label_box_pad)
+            box_br = (cand_pt[0] + w//2 + cand_label_box_pad, cand_pt[1] + h//2 + cand_label_box_pad)
+            cv2.rectangle(canvas, box_tl, box_br, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.rectangle(canvas, box_tl, box_br, border_color, border_width, cv2.LINE_AA)
+            
+            # 3.4 Label Text (A, B, C...)
+            text_x = cand_pt[0] - w // 2
+            text_y = cand_pt[1] + h // 2
+            cv2.putText(canvas, label, (text_x, text_y), 
+                        cv2.FONT_HERSHEY_SIMPLEX, font_scale, COLOR_TEXT, label_thickness, cv2.LINE_AA)
+            
+            # 3.5 [Zoom View] Show Semantic Label (Only if not just "Ready")
+            # [MODIFIED] Only draw text if it adds semantic value beyond the green color.
+            if is_zoomed and semantic_label != "Ready":
+                (cw, ch), _ = cv2.getTextSize(semantic_label, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+                cx = cand_pt[0] - cw // 2
+                cy = box_br[1] + ch + 2
+                cv2.putText(canvas, semantic_label, (cx, cy), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, border_color, 1, cv2.LINE_AA)
+
+        # === Layer 4: Current Agent ===
+        curr_pt = tuple(pts[current_node_idx])
+        curr_size = 10 if is_zoomed else 6
+        if current_node_idx == 0:
+            cv2.rectangle(canvas, (curr_pt[0]-curr_size-2, curr_pt[1]-curr_size-2), 
+                      (curr_pt[0]+curr_size+2, curr_pt[1]+curr_size+2), (255,255,255), -1, cv2.LINE_AA)
+            cv2.rectangle(canvas, (curr_pt[0]-curr_size, curr_pt[1]-curr_size), 
+                      (curr_pt[0]+curr_size, curr_pt[1]+curr_size), COLOR_DEPOT, -1, cv2.LINE_AA)
         else:
-             cv2.circle(canvas, pt, 5, (0, 0, 255), -1, cv2.LINE_AA) # Red dot
-        
-        # Draw Label
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.5
-        thick = 1
-        (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
-        
-        tx = pt[0] + 6
-        ty = pt[1] - 6
-        tx = min(tx, img_size - tw - 2)
-        ty = max(ty, th + 2)
-        
-        cv2.rectangle(canvas, (tx-1, ty-th-1), (tx+tw+1, ty+2), (255, 255, 255), -1)
-        cv2.putText(canvas, label, (tx, ty), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+            cv2.rectangle(canvas, (curr_pt[0]-curr_size-2, curr_pt[1]-curr_size-2), 
+                      (curr_pt[0]+curr_size+2, curr_pt[1]+curr_size+2), (255,255,255), -1, cv2.LINE_AA)
+            cv2.rectangle(canvas, (curr_pt[0]-curr_size, curr_pt[1]-curr_size), 
+                      (curr_pt[0]+curr_size, curr_pt[1]+curr_size), COLOR_CURRENT_FILL, -1, cv2.LINE_AA)
 
-    # --- Output ---
-    _, buffer = cv2.imencode('.png', canvas)
-    b64_str = base64.b64encode(buffer).decode('utf-8')
-    img_rgb_np = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    # --- 6. Execute Drawing ---
+    draw_scene(left_roi, global_transform, is_zoomed=False)
+    if top_candidates:
+        # ... (Focus box logic same as before) ...
+        box_p1 = global_transform(g_center - g_span * 0.15); box_p2 = global_transform(g_center + g_span * 0.15) # Simplified for brevity, use actual zoom calculation
+        # Re-calculate real zoom bounds for drawing box
+        z_span_half = zoom_span / 2.0
+        z_real_min = curr_pos - z_span_half
+        z_real_max = curr_pos + z_span_half
+        box_p1 = global_transform(z_real_min)
+        box_p2 = global_transform(z_real_max)
+        x1, y1 = min(box_p1[0], box_p2[0]), min(box_p1[1], box_p2[1])
+        x2, y2 = max(box_p1[0], box_p2[0]), max(box_p1[1], box_p2[1])
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(img_height-1, x2), min(img_height-1, y2)
+        if x2 > x1 and y2 > y1:
+            cv2.rectangle(left_roi, (x1, y1), (x2, y2), COLOR_ZOOM_BOX, 2, cv2.LINE_AA)
+            cv2.line(combined_canvas, (x2, y1), (img_height, 0), COLOR_ZOOM_BOX, 1, cv2.LINE_AA)
+            cv2.line(combined_canvas, (x2, y2), (img_height, img_height), COLOR_ZOOM_BOX, 1, cv2.LINE_AA)
+
+    draw_scene(right_roi, zoom_transform, view_bounds=(curr_pos-zoom_span/2, curr_pos+zoom_span/2), is_zoomed=True)
     
+    # --- 7. Legend (Semantic Only) ---
+    def draw_legend(img):
+        start_x, start_y = 20, img_height - 20
+        line_height = 25
+        font_scale = 0.5
+        font_color = (60, 60, 60)
+        def draw_item(y, text, draw_icon_fn):
+            draw_icon_fn(start_x, y - 8)
+            cv2.putText(img, text, (start_x + 25, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_color, 1, cv2.LINE_AA)
+            return y - line_height
+        current_y = start_y
+        def icon_depot(x, y): cv2.rectangle(img, (x-6, y-6), (x+6, y+6), COLOR_DEPOT, -1)
+        current_y = draw_item(current_y, "Depot (Base)", icon_depot)
+        def icon_return(x, y):
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), (255,255,255), -1)
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), COLOR_VRP_RETURN, 2)
+        current_y = draw_item(current_y, "Return to Base", icon_return)
+        def icon_urgent(x, y):
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), (255,255,255), -1)
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), COLOR_VRP_URGENT, 2)
+        current_y = draw_item(current_y, "Urgent (Low Slack)", icon_urgent)
+        def icon_wait(x, y):
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), (255,255,255), -1)
+            cv2.rectangle(img, (x-7, y-7), (x+7, y+7), COLOR_VRP_WAIT, 2)
+        current_y = draw_item(current_y, "Waiting Needed", icon_wait)
+    draw_legend(left_roi)
+    
+    # Titles & Time (Time is okay, it's global context)
+    cv2.rectangle(combined_canvas, (img_height, 0), (img_width-1, img_height-1), COLOR_BORDER, 4)
+    cv2.putText(left_roi, "Global Map", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80,80,80), 2, cv2.LINE_AA)
+    cv2.putText(right_roi, "Egocentric View", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80,80,80), 2, cv2.LINE_AA)
+    cv2.putText(right_roi, f"Time: {current_time:.1f}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 1, cv2.LINE_AA)
+
+    # --- 8. Output ---
+    _, buffer = cv2.imencode('.png', combined_canvas)
+    b64_str = base64.b64encode(buffer).decode('utf-8')
+    img_rgb_np = cv2.cvtColor(combined_canvas, cv2.COLOR_BGR2RGB)
     if debug_save_path:
         os.makedirs(os.path.dirname(debug_save_path) if os.path.dirname(debug_save_path) else ".", exist_ok=True)
-        cv2.imwrite(debug_save_path, canvas)
-    
+        cv2.imwrite(debug_save_path, combined_canvas)
     return b64_str, img_rgb_np
 
 def render_lrp_image(
