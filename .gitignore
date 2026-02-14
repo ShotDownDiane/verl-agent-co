@@ -14,12 +14,14 @@
 **/wandb
 **/*.json
 **/*.pth
+**/*.log
+**/*.txt
 checkpoint/
 examples/prompt_agent/cot/
 env/tdtsp/data
 env/tdvrp/data
 scripts/test
-example/prompt_agent/*
+examples/grpo_trainer/prompt_agent/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
