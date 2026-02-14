@@ -64,6 +64,7 @@ class TrajectoryCollector:
         apply_chat_template_kwargs = self.config.data.get("apply_chat_template_kwargs", {})
         
         # Get observation components
+        system_prompt = obs.get('system_prompt', None)
         obs_texts = obs.get('text', None)
         obs_images = obs.get('image', None)
         obs_anchors = obs.get('anchor', None)
@@ -86,11 +87,18 @@ class TrajectoryCollector:
         else:
             print(f"Warning: No text observation found!")
 
-        
-        chat = np.array([{
-            "content": obs_content,
-            "role": "user",
-        }])
+        if system_prompt is None:
+            system_prompt = "You are a helpful assistant."
+        chat = np.array([
+            {
+                "content": system_prompt,
+                "role": "system",
+            },
+            {
+                "content": obs_content,
+                "role": "user",
+            }
+        ])
         
         # Apply chat template
         prompt_with_chat_template = self.tokenizer.apply_chat_template(
@@ -501,7 +509,7 @@ class TrajectoryCollector:
             DataProto: Final collected trajectory data with metadata.
         """
         if is_train:
-            gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
+            gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n*self.config.env.batch_size, interleave=True)
             
         # Initial observations from the environment
         if self.config.algorithm.filter_groups.enable and is_train:

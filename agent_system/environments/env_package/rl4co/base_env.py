@@ -29,8 +29,12 @@ class BaseCOWorker:
         else:
             self.load_from_path = False
 
+        self.batch_size = kwargs.get("batch_size", 1)
+        print(f"batch_size: {self.batch_size}")
+        self.group_size = env_num
         self.env_name = env_name.lower()
-        self.env_num = env_num
+        self.env_num = self.group_size * self.batch_size
+        print(f"env_num: {self.env_num}")
         self.device = torch.device(device)
         self.actions: List[Any] = []
         self.return_topk_options = return_topk_options > 0
@@ -63,7 +67,7 @@ class BaseCOWorker:
         
         self._td = td
         self.actions = []
-        infos = [{}] * self.env_num
+        infos = [{} for _ in range(self.env_num)]
 
         # If topk mode is enabled, we might need an initial step or setup
         self._td = self._post_reset_hook(self._td)
@@ -100,6 +104,22 @@ class BaseCOWorker:
 
                 if 0 <= sel_idx < len(candidates):
                     real_action = candidates[sel_idx].item()
+                    if real_action == -1:
+                        # 选到了 Padding，直接强行切回 Top-1 (假设 candidates[0] 肯定不是 -1)
+                        if candidates[0] != -1:
+                            return candidates[0].item()
+                        else:
+                            # 如果 candidates[0] 也是 -1，返回 0 表示无效
+                            print(f"Warning: candidates[0] is -1. candidates: {candidates}")
+                            action_mask = self._td.get("action_mask")[env_idx]
+                            print(f"action mask is {action_mask}")
+                            target_index = action_mask.nonzero().squeeze(1)
+                            if target_index.shape[0] > 0:
+                                action = torch.randint(0, target_index.shape[0], (1,)).item()
+                                return target_index[action].item()
+                            else:
+                                return 0
+
                     # Double check mask
                     mask = self._td.get("action_mask")[env_idx]
                     if mask[real_action]:
@@ -156,15 +176,18 @@ class BaseCOWorker:
 
     def step(self, action) -> Tuple[List[str], List[float], List[bool], List[Dict[str, Any]]]:
         if self.done:
-            return ["The environment has closed."] * self.env_num, [0] * self.env_num, [True] * self.env_num, [{}] * self.env_num
-
+            # white image
+            img_size = 448
+            img = np.ones((img_size, img_size, 3), dtype=np.uint8) * 255
+            obs = [{"text": "The environment has closed.", "image": img, "obs": "The environment has closed.", "candidates": "No Candidates"} for _ in range(self.env_num)]
+            return obs, [0] * self.env_num, [True] * self.env_num, [{} for _ in range(self.env_num)]
         projected_action = self.actions_projection(action)
         self.actions.append(projected_action)
         
         action_tensor = torch.as_tensor(
             projected_action, device=self.device, dtype=torch.int64
         )
-        
+
         self._td.set("action", action_tensor)
         out = self.base_env.step(self._td)
         next_td = out["next"] if isinstance(out, dict) and "next" in out else out
@@ -173,6 +196,7 @@ class BaseCOWorker:
             raise TypeError(f"Expected TensorDict from step, got {type(next_td)}")
         self._td = next_td
 
+        # step reward is zero
         rewards = [0] * self.env_num
         dones = next_td["done"]
         
@@ -184,8 +208,14 @@ class BaseCOWorker:
                 rewards = rewards.tolist()
             self.done = True
         
-        infos = [{}] * self.env_num
-        obs = self.build_obs(self._td)
+        infos = [{} for _ in range(self.env_num)]
+        if not self.done:
+            obs = self.build_obs(self._td)
+        else:
+            img_size = 448
+            img = np.ones((img_size, img_size, 3), dtype=np.uint8) * 255
+            obs = [{"text": "The environment has closed.", "image": img, "obs": "The environment has closed.", "candidates": "No Candidates"} for _ in range(self.env_num)]
+        
         
         dones_list = dones.tolist() if isinstance(dones, torch.Tensor) else list(dones)
         
@@ -207,9 +237,10 @@ class BaseCOEnvs(gym.Env):
     ):
         super().__init__()
         self.env_name = env_name
-        self.num_processes = env_num * group_n
+        # self.num_processes = env_num * group_n
         self.env_num = env_num
         self.group_n = group_n
+        self.batch_size = env_kwargs.get("batch_size", 1)
         
         if not ray.is_initialized():
             ray.init()
@@ -247,34 +278,36 @@ class BaseCOEnvs(gym.Env):
         return args, (env_kwargs if env_kwargs else {})
 
     def step(self, actions):
-        assert len(actions) == self.num_processes, "The num of actions must be equal to the num of processes"
+        assert len(actions) == self.env_num*self.group_n*self.batch_size, "The num of actions must be equal to the num of processes"
         actions = np.array(actions)
-        actions = actions.reshape((self.env_num, self.group_n))
+        actions = actions.reshape((self.env_num, self.group_n*self.batch_size))
         
         futures = [worker.step.remote(actions[i]) for i, worker in enumerate(self.workers)]
         results = ray.get(futures)
 
-        text_obs_list = []
+        obs_list = []
         rewards_list = []
         dones_list = []
         info_list = []
 
         for i in range(self.env_num):
-            for j in range(self.group_n):
-                text_obs_list.append(results[i][0][j])
+            for j in range(self.group_n*self.batch_size):
+                obs_list.append(results[i][0][j])
                 rewards_list.append(results[i][1][j])
                 dones_list.append(results[i][2][j])
                 info_list.append(results[i][3][j])
 
-        return text_obs_list, rewards_list, dones_list, info_list
+        return obs_list, rewards_list, dones_list, info_list
 
     def reset(self):
         futures = [worker.reset.remote() for worker in self.workers]
         results = ray.get(futures)
         
-        text_obs_list = []
+        obs_list = []
+        info_list = []
         for i in range(self.env_num):
-            for j in range(self.group_n):
-                text_obs_list.append(results[i][0][j])
+            for j in range(self.group_n*self.batch_size):
+                obs_list.append(results[i][0][j])
+                info_list.append(results[i][1][j])
         
-        return text_obs_list
+        return obs_list, info_list

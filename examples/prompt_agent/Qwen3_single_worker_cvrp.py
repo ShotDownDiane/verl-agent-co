@@ -4,9 +4,11 @@ import pickle
 import torch
 import numpy as np
 import re
+import base64
 from types import SimpleNamespace
 from omegaconf import OmegaConf
 import ray
+import math
 import json
 
 class NumpyEncoder(json.JSONEncoder):
@@ -23,7 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 from agent_system.environments.env_manager import make_envs
 from examples.prompt_agent.llm_agent import LLMAgent
 from functools import partial
-from agent_system.environments.env_package.rl4co.route_obs import build_obs_cvrp
+from agent_system.environments.env_package.rl4co.route_obs import build_obs_cvrp, render_cvrp_image
 from agent_system.environments.env_package.rl4co.route_envs import RouteWorker
 from agent_system.environments.env_manager import RouteEnvironmentManager
 from agent_system.environments.env_package.rl4co.projection import co_projection_selected
@@ -36,212 +38,6 @@ def _to_numpy(x):
 global COUNT
 COUNT = 0
 
-# def build_obs_cvrp(
-#     td, 
-#     env_num: int, 
-#     trajectory: list = None, 
-#     top_k: int = 5, 
-#     given_topk_acts = None,
-#     image_obs: bool = True,
-#     **kwargs
-# ) -> list:
-#     """
-#     构建 CVRP 任务的 Observation (Prompt + Image)。
-#     支持 'given_topk_acts' 用于 Teacher Forcing / Injection。
-
-#     Args:
-#         td (TensorDict): 包含 'locs', 'demand', 'used_capacity', 'vehicle_capacity' 等。
-#         env_num (int): Batch size。
-#         trajectory (list): 历史轨迹。
-#         given_topk_acts (Tensor/Array): [Batch, K] 强制指定的候选集。
-
-#     Returns:
-#         obs_list (list): [(prompt_text, image_base64), ...]
-#     """
-#     obs_list = []
-    
-#     # --- 1. 数据提取 (Batch处理) ---
-#     locs = _to_numpy(td["locs"])                 # (B, N, 2)
-#     demands = _to_numpy(td["demand"])            # (B, N) - 注意：通常不包含Depot需求，或Depot为0
-#     current_node = _to_numpy(td["current_node"]) # (B,)
-#     used_capacity = _to_numpy(td["used_capacity"]) # (B, 1) or (B,)
-#     vehicle_capacity = _to_numpy(td["vehicle_capacity"]) # (B, 1) or (B,)
-#     topk_acts = []
-    
-#     # 访问掩码 (1=visited/invalid)
-#     if "action_mask" in td.keys():
-#         visited = _to_numpy(td["action_mask"])   
-#     else:
-#         visited = np.zeros((env_num, locs.shape[1]))
-
-#     # 处理 given_topk_acts
-#     if given_topk_acts is not None:
-#         given_topk_acts = _to_numpy(given_topk_acts)
-
-#     # --- 2. 遍历每个环境 ---
-#     for idx in range(env_num):
-#         # 基础状态
-#         curr_locs = locs[idx]          # (N, 2)
-#         curr_demands = demands[idx]    # (N,)
-#         curr_idx = int(current_node[idx])
-#         curr_visited = visited[idx]    # (N,)
-        
-#         # 载重状态
-#         curr_used = float(used_capacity[idx])
-#         curr_cap = float(vehicle_capacity[idx])
-#         remaining_cap = curr_cap - curr_used
-        
-        
-#         # --- A. 轨迹处理 ---
-#         path_history = []
-#         if trajectory is not None and len(trajectory) > 0:
-#             for t_step in trajectory:
-#                 val = t_step[idx]
-#                 if hasattr(val, 'item'): val = val.item()
-#                 path_history.append(int(val))
-        
-#         if len(path_history) == 0 or path_history[-1] != curr_idx:
-#             path_history.append(curr_idx)
-
-#         # --- B. 生成 Top-K 候选集 ---
-#         candidates = []
-#         curr_pos = curr_locs[curr_idx]
-        
-#         # 分支 1: 注入模式 (Injection)
-#         if given_topk_acts is not None:
-#             topk_indices = given_topk_acts[idx]
-            
-#             for cand_idx in topk_indices:
-#                 cand_idx = int(cand_idx)
-                
-#                 # 获取该点的需求量
-#                 # 注意处理索引偏移：通常 locs[0] 是 depot, demands[0] 是 customer 1
-#                 # 假设 demands 长度比 locs 少 1 (不含 depot) 或 长度相等 (含 depot=0)
-#                 # 这里假设通用情况：demands 对应 locs 索引
-#                 node_demand = 0.0
-#                 if cand_idx < len(curr_demands): 
-#                     node_demand = float(curr_demands[cand_idx])
-#                 # 如果是 Depot (Node 0)，需求强制为 0
-#                 if cand_idx == 0: node_demand = 0.0
-
-#                 dist_val = np.linalg.norm(curr_locs[cand_idx] - curr_pos)
-                
-#                 candidates.append({
-#                     "id": cand_idx,
-#                     "dist": dist_val,
-#                     "demand": node_demand,
-#                     "is_depot": (cand_idx == 0),
-#                     "x": curr_locs[cand_idx][0],
-#                     "y": curr_locs[cand_idx][1]
-#                 })
-
-#         # 分支 2: 自动模式 (Greedy KNN)
-#         else:
-#             dists = cdist(curr_pos.reshape(1, 2), curr_locs, metric='euclidean').flatten()
-            
-#             # Mask 逻辑：
-#             # 1. 已访问的点不能去 (visited==1)
-#             # 2. 除非是 Depot (Node 0)，Depot 总是可以回去 (即使 visited 标记了)
-#             #    但是，通常 CVRP 环境的 mask 会处理好 Depot 的可见性。
-#             #    如果 mask[0] == 1 表示不能回库（比如刚出来）。
-#             # 这里简单起见，信赖 env 给的 mask，但手动修正 mask[0] 的距离
-            
-#             # 先全部 mask 掉已访问
-#             dists[curr_visited == 1] = np.inf
-#             # 自身设为无穷大
-#             dists[curr_idx] = np.inf
-            
-#             # 如果 mask 允许回库，确保距离计算正确
-#             if curr_visited[0] == 0:
-#                 # Depot 可选
-#                 pass
-            
-#             # 排序
-#             sorted_indices = np.argsort(dists)
-#             topk_indices = sorted_indices[:top_k]
-#             topk_acts.append(topk_indices)
-            
-#             for cand_idx in topk_indices:
-#                 dist_val = dists[cand_idx]
-#                 if dist_val == np.inf: break
-#                 if len(candidates) >= top_k: break
-                
-#                 cand_idx = int(cand_idx)
-#                 node_demand = 0.0
-#                 if cand_idx < len(curr_demands): node_demand = float(curr_demands[cand_idx])
-#                 if cand_idx == 0: node_demand = 0.0
-
-#                 candidates.append({
-#                     "id": cand_idx,
-#                     "dist": dist_val,
-#                     "demand": node_demand,
-#                     "is_depot": (cand_idx == 0),
-#                     "x": curr_locs[cand_idx][0],
-#                     "y": curr_locs[cand_idx][1]
-#                 })
-
-#         # --- C. 绘图 (需实现 render_cvrp_image) ---
-#         # 传入 capacity info 用于在图上显示当前载重
-#         img_b64 = "PLACEHOLDER"
-#         try:
-#              # 如果你有 render 函数，取消注释
-#              # img_b64 = render_cvrp_image(
-#              #     curr_locs, curr_visited, curr_idx, path_history, candidates, 
-#              #     capacity_status=(curr_used, curr_cap)
-#              # )
-#              pass
-#         except:
-#             pass
-
-#         # --- D. 构建文本 Prompt ---
-#         cand_str_list = []
-#         for rank, cand in enumerate(candidates):
-#             label = chr(65 + rank)
-            
-#             # 特殊显示 Depot
-#             node_type = "**DEPOT (Refill)**" if cand['is_depot'] else f"Customer {cand['id']}"
-            
-#             # 需求显示逻辑
-#             demand_info = f", Demand: {cand['demand']:.2f}" if not cand['is_depot'] else ""
-            
-#             # 辅助判断：能不能装下？
-#             # 仅作为 Info 给 LLM，不做硬性过滤，让 LLM 自己学
-#             feasible_mark = "" 
-#             if not cand['is_depot'] and cand['demand'] > remaining_cap:
-#                 feasible_mark = " [OVERLOAD!]" # 提示 LLM 这个点去了会超载（除非环境允许部分配送）
-
-#             cand_str_list.append(
-#                 f"Option {label} [{node_type}]: "
-#                 f"Dist: {cand['dist']*100:.1f}{demand_info}{feasible_mark}"
-#             )
-#         cand_section = "\n".join(cand_str_list)
-        
-#         # 统计剩余未访问客户数 (排除 Depot)
-#         # 假设 mask[0] 不代表“所有客户都送完了”，只统计 index 1..N
-#         unvisited_customers = np.sum(curr_visited[1:] == 0)
-#         step_val = len(path_history)
-#         obs = (
-#             f"### Task: Capacitated Vehicle Routing Problem (CVRP)\n"
-#             f"Step: {step_val}\n\n"
-#             f"### Status:\n"
-#             f"- Current Location: Node {curr_idx} ({'Depot' if curr_idx==0 else 'Customer'})\n"
-#             f"- Vehicle Load: {curr_used:.2f} / {curr_cap:.2f} (Remaining: {remaining_cap:.2f})\n"
-#             f"- Unvisited Customers: {unvisited_customers}\n"
-#             f"- Path History (Last 10): {path_history[-10:]}\n\n"
-#             f"### Candidate Options:\n"
-#             f"{cand_section}\n\n"
-#             f"### Instruction:\n"
-#             f"Select the Option Label (A, B...) to visit next. "
-#             f"Prioritize visiting customers if capacity allows. "
-#             f"Return to Depot (Node 0) ONLY if capacity is insufficient or all customers are served."
-#         )
-        
-#         if image_obs and img_b64:
-#             obs_list.append({"text": obs, "image": img_b64})
-#         else:
-#             obs_list.append(obs)
-
-#     return obs_list
 
 class LoadedDataGenerator:
     def __init__(self, data_list, device="cpu"):
@@ -345,47 +141,111 @@ def load_data():
     return graph_data, routing_data
 
 
-def get_solution_from_data(data_item):
+def get_solution_from_data(data_item, locs, depot_loc):
     """
-    Extract solution tour from data item if available.
-    User indicated that data includes 'obj', so we check for explicit solution fields.
+    Extract solution tour from data item and SORT routes by polar angle.
+    
+    Args:
+        data_item: dict containing solver output
+        locs: torch.Tensor, shape (N, 2) - Customer coordinates
+        depot_loc: torch.Tensor, shape (1, 2) - Depot coordinate
+    
+    Returns:
+        np.array: Flattened, sorted node sequence.
     """
     keys_to_check = ['tour', 'solution', 'actions', 'node_sequence']
+    raw_routes = None
+
+    # 1. Extract the raw routes (List of Lists)
     for key in keys_to_check:
         if key in data_item:
-            # print(f"Found solution in key '{key}'.")
             val = data_item[key]
-            if isinstance(val[0][0], list):
-                # Flatten nested list
-                val = val[0]
-                val = [item for sublist in val for item in sublist]
-                val = [val]
-            if isinstance(val, torch.Tensor):
-                val = val.numpy()
-            else:
-                val = np.array(val)
-            return val.flatten()
+            # Handle standard nested list structure [[route1], [route2]]
+            if isinstance(val, list):
+                # Check if it's double nested like [[ [r1], [r2] ]] (batch dim artifact)
+                if len(val) > 0 and isinstance(val[0], list) and len(val[0]) > 0 and isinstance(val[0][0], list):
+                    val = val[0] 
+                raw_routes = val
+            elif isinstance(val, torch.Tensor):
+                # If it's a tensor, we assume it might be padded or needs careful handling
+                # Converting to list of lists for easier manipulation
+                # This part depends on your tensor shape, assuming it separates routes somehow
+                # or is just a flat sequence that we can't easily sort without delimiters.
+                # For safety, let's convert to numpy if it's simple.
+                raw_routes = val.tolist()
+            elif isinstance(val, np.ndarray):
+                raw_routes = val.tolist()
             
-    # Check if 'objs' contains the solution (unlikely but checking based on user hint)
-    if 'objs' in data_item:
-        objs = data_item['objs']
-        # If objs is a list of integers/arrays, it might be the tour
-        # But we saw it's a list of floats (costs).
-        # We'll print a warning if we can't find a tour.
-        print(f"Found 'objs' key with type {type(objs)}. Sample: {objs[:1] if isinstance(objs, list) else objs}")
-        if isinstance(objs, (list, np.ndarray)) and len(objs) > 1 and isinstance(objs[0], (int, np.integer)):
-             print("Assuming 'objs' contains the tour sequence.")
-             return np.array(objs)
+            break # Found a key
+            
+    if raw_routes is None:
+        print("Warning: No explicit solution tour found.")
+        return None
 
-    print("Warning: No explicit solution tour found in data item.")
-    return None
+    # Ensure raw_routes is a list of lists: [[1, 5, 2], [3, 4], ...]
+    # If it was already flattened, we can't sort by route. 
+    # We assume the solver output maintains route separation (e.g., LKH usually does).
+    if not isinstance(raw_routes[0], list):
+        # Fallback: If data is already flattened, we can't sort petals. Return as is.
+        return np.array(raw_routes)
+
+    # 2. Define Helper to calculate Route Angle
+    def get_route_angle(route):
+        """Calculates the polar angle of the route's centroid relative to depot."""
+        if not route: return 0
+        
+        # Gather coordinates for all nodes in this route
+        # Assumption: route indices map to 'locs'. 
+        # Check if indices are 1-based (common in VRPLIB) or 0-based.
+        # If your locs includes depot at 0, then index is direct. 
+        # If locs is ONLY customers, and route uses 1-based index: idx-1.
+        # Here we assume standard Python 0-based index into 'locs' for simplicity.
+        # You may need to adjust (n-1) if your solver uses 1-based indexing.
+        
+        route_coords = []
+        for node_idx in route:
+            # Safety check for index bounds
+            if node_idx < len(locs):
+                route_coords.append(locs[node_idx-1])
+                break
+        
+        if not route_coords: return 0
+        
+        # Convert to tensor/numpy for mean calc
+        if isinstance(route_coords[0], torch.Tensor):
+            stack_coords = torch.stack(route_coords)
+            centroid = torch.mean(stack_coords, dim=0)
+            cx, cy = centroid[0].item(), centroid[1].item()
+        else:
+            stack_coords = np.array(route_coords)
+            centroid = np.mean(stack_coords, axis=0)
+            cx, cy = centroid[0], centroid[1]
+
+        # Depot coordinates
+        if isinstance(depot_loc, torch.Tensor):
+            dx, dy = depot_loc[0][0].item(), depot_loc[0][1].item()
+        else:
+            dx, dy = depot_loc[0][0], depot_loc[0][1]
+
+        # Calculate Angle (atan2 returns -pi to pi)
+        return -math.atan2(cy - dy, cx - dx)
+
+    # 3. Sort Routes based on Angle
+    # This aligns the routes in a circular sweep order (e.g., -pi to pi)
+    sorted_routes = sorted(raw_routes, key=get_route_angle)
+
+    # 4. Flatten the result for the Agent
+    # Now the sequence is: Petal 1 -> Petal 2 -> Petal 3 (sequentially adjacent)
+    flat_solution = [node for route in sorted_routes for node in route]
+
+    return np.array(flat_solution)
 
 
 import torch
 import numpy as np
 import traceback
 
-def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
+def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp", instance_idx=0):
     # print(f"Resetting environments...")
     obs, infos = envs.reset()
     trajectory = []
@@ -393,6 +253,35 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
     solution_tour_list = []
     image_list = []
     candidates_list = []
+    
+    # Capture static info
+    all_demand = envs._td['demand'][0].cpu().numpy().tolist()
+    vehicle_capacity = envs._td['vehicle_capacity'][0].item()
+    load_list = []
+    
+    os.makedirs(f"debug_images/{env_name}", exist_ok=True)
+    
+    
+    # Generate Pure Obs Image (Start)
+    pure_obs_image = ""
+    if hasattr(envs, '_td'):
+        pure_obs_path = f"debug_images/{env_name}/inst_{instance_idx}_pure_obs.png"
+        try:
+            render_cvrp_image(
+                locs=envs._td['locs'][0].cpu().numpy(),
+                demands=envs._td['demand'][0].cpu().numpy(),
+                visited_mask=np.zeros(envs._td['locs'][0].shape[0], dtype=bool),
+                current_node_idx=0, # Depot
+                path_history=[0],
+                used_capacity=0.0,
+                vehicle_capacity=envs._td['vehicle_capacity'][0].item(),
+                top_candidates=[],
+                debug_save_path=pure_obs_path
+            )
+            pure_obs_image = pure_obs_path
+        except Exception as e:
+            print(f"Error generating pure obs image: {e}")
+            traceback.print_exc()
     
     # =========================================================================
     # 1. 获取全局坐标 (用于计算几何距离)
@@ -416,6 +305,10 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
     i = 0
     solution_tour = np.insert(solution_tour,0,0)
     while True:
+        # Record current load
+        current_load = envs._td['used_capacity'][0].item()
+        load_list.append(current_load)
+
         # print(f"\n--- Step {i+1} ---")
         obs_text, img = obs[0]['text'], obs[0]['image']
         actions = []
@@ -436,7 +329,6 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
         candidates_list.append(current_candidates)
         
         chosen_label = "0" # Default
-        
         if solution_tour is not None and current_node is not None:
             # Sequential matching for Routing (TSP/CVRP)
             try:
@@ -456,6 +348,7 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
                         if len(matches) > 0:
                             # print(f"Recovered: Found {c_node} at offset {matches[0]}")
                             tour_idx += matches[0]
+                            print(f"Recovered: Found {c_node} at offset {matches[0]}. New index: {tour_idx}")
                         else:
                             # print("Lost track of tour. Continuing blindly.")
                             pass
@@ -495,10 +388,13 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
                                 acts_container = envs._td['topk_acts'][0]
                                 acts_container[target_idx_in_opts] = t_node
                                 found_opt = True
-                                obs_new = build_obs_cvrp(envs._td, 1, envs.actions,given_topk_acts=[acts_container], image_obs=True)
+                                obs_new = build_obs_cvrp(envs._td, 1, envs.actions, given_topk_acts=[acts_container], image_obs=True)
                                 global COUNT
                                 COUNT += 1     
                                 print(f"error {COUNT}")
+                                # 更新 obs_text 和 img
+                                obs_text = obs_new[0]['text']
+                                img = obs_new[0]['image']
 
                         # D. 生成 Label
                         if found_opt:
@@ -518,7 +414,7 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
                                  chosen_label = 'A'
                     else:
                         print("At end of tour.")
-                        chosen_label = "0"
+                        raise ValueError("Tour index out of bounds.")
                 else:
                      # print("Tour index out of bounds.")
                      pass
@@ -529,12 +425,26 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
         
         # Format action for projection
         action_str = f"\\boxed{{{chosen_label}}}"
+        action_str_clean = f"{chosen_label}"
         print(f"Action: {action_str}")
         actions.append(action_str)
-        trajectory.append(action_str)
+        trajectory.append(action_str_clean)
         obs_list.append(obs_text)
         solution_tour_list.append(solution_tour)
-        image_list.append(img)
+        
+        # Save step image from obs
+        if img:
+            try:
+                img_data = base64.b64decode(img)
+                step_img_path = f"debug_images/{env_name}/inst_{instance_idx}_step_{i}.png"
+                with open(step_img_path, "wb") as f:
+                    f.write(img_data)
+                image_list.append(img)
+            except Exception as e:
+                print(f"Error saving step image: {e}")
+                image_list.append("")
+        else:
+            image_list.append("")
         
         # print(f"Action: {action_str}")
         actions, valids = co_projection_selected(actions, env_name=env_name)
@@ -547,7 +457,45 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
             # print("All environments done.")
             break
 
-    return obs_list, image_list, trajectory, candidates_list, all_coords_map
+    # Generate Final Solution Image
+    final_solution_image = ""
+    if hasattr(envs, '_td'):
+        final_sol_path = f"debug_images/{env_name}/inst_{instance_idx}_final_solution.png"
+        try:
+            # Reconstruct path from trajectory and candidates
+            path_indices = [0] # Start at depot
+            for i, action_str in enumerate(trajectory):
+                lbl = action_str
+                if 'A' <= lbl <= 'Z':
+                    idx = ord(lbl) - ord('A')
+                    if i < len(candidates_list):
+                        cands = candidates_list[i]
+                        if idx < len(cands):
+                            path_indices.append(cands[idx])
+            
+            # Calculate visited mask based on path
+            visited_mask = np.zeros(envs._td['locs'][0].shape[0], dtype=bool)
+            for node_idx in path_indices:
+                if node_idx != 0:
+                    visited_mask[node_idx] = True
+            path_indices.append(0)
+            render_cvrp_image(
+                locs=envs._td['locs'][0].cpu().numpy(),
+                demands=envs._td['demand'][0].cpu().numpy(),
+                visited_mask=visited_mask,
+                current_node_idx=path_indices[-1],
+                path_history=path_indices,
+                used_capacity=envs._td['used_capacity'][0].item(),
+                vehicle_capacity=envs._td['vehicle_capacity'][0].item(),
+                top_candidates=[],
+                debug_save_path=final_sol_path
+            )
+            final_solution_image = final_sol_path
+        except Exception as e:
+            print(f"Error generating final solution image: {e}")
+            traceback.print_exc()
+
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map, pure_obs_image, final_solution_image, all_demand, load_list, vehicle_capacity
 
 def main():
     _, routing_data = load_data()
@@ -567,12 +515,13 @@ def main():
     cvrp_data = routing_data['cvrp']
     n = len(cvrp_data)
     json_container = []
-
     for i in range(n):
         generator = LoadedDataGenerator(cvrp_data[i:i+1])
         
         # Try to get solution from data
-        solution_tour = get_solution_from_data(cvrp_data[i])
+        locs = cvrp_data[i]['td']['locs'][0]
+        depot_loc = cvrp_data[i]['td']['depot']
+        solution_tour = get_solution_from_data(cvrp_data[i], locs, depot_loc)
         if solution_tour is None:
             print("No solution tour available in data.")
 
@@ -590,7 +539,6 @@ def main():
             image_obs=True,
             env_kwargs={"generator": generator}
         )
-        
         # Define projection function
         projection_f = partial(co_projection_selected, env_name="cvrp")
     
@@ -598,7 +546,7 @@ def main():
         # Ensure generator starts from 0 for the agent loop
         generator.idx = 0
         
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour)
+        obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_image, final_solution_image, demand, load_list, capacity = run_agent_loop(worker, agent, solution_tour, instance_idx=i)
 
         json_container.append({
             "node_coords": node_coords,
@@ -606,7 +554,12 @@ def main():
             "obs_list": obs_list,
             "image_list": image_list,
             "candidates": candidates_list,
-            "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
+            "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else [],
+            "pure_obs_image_path": pure_obs_image,
+            "final_solution_image_path": final_solution_image,
+            "demand": demand,
+            "load_list": load_list,
+            "capacity": capacity
         })
     
     with open("cvrp_agent_output.json", "w") as f:

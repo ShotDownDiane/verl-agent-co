@@ -6,6 +6,7 @@ import os
 import logging
 import time
 import base64
+import numpy as np
 from typing import Optional, Union, List
 from io import BytesIO
 from PIL import Image
@@ -215,6 +216,12 @@ class VLMAgent:
         elif isinstance(image, bytes):
             # 字节数据
             return base64.b64encode(image).decode('utf-8')
+        elif isinstance(image, np.ndarray):
+            # NumPy 数组 (通常是 RGB)
+            buf = BytesIO()
+            pil_img = Image.fromarray(image.astype('uint8'))
+            pil_img.save(buf, format='PNG')
+            return base64.b64encode(buf.getvalue()).decode('utf-8')
         else:
             raise ValueError(f"Unsupported image type: {type(image)}")
     
@@ -254,20 +261,111 @@ class VLMAgent:
         logger.info(f"Generation completed in {elapsed_time:.2f}s")
         
         return result
+        
+    def batch_generate(
+        self,
+        system_prompts: Union[str, List[str]],
+        texts: List[str],
+        images: Optional[List[Union[str, Image.Image, bytes]]] = None,
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        max_workers: int = 16
+    ) -> List[str]:
+        """
+        批量生成文本
+        """
+        start_time = time.time()
+        batch_size = len(texts)
+        
+        # Normalize system_prompts
+        if isinstance(system_prompts, str):
+            system_prompts = [system_prompts] * batch_size
+            
+        # Normalize images
+        if images is None:
+            images = [None] * batch_size
+        
+        if len(system_prompts) != batch_size or len(images) != batch_size:
+            raise ValueError("Length of system_prompts, texts, and images must match")
+
+        results = []
+        
+        if self.mode == 'api':
+            # Use ThreadPoolExecutor for parallel API calls
+            from concurrent.futures import ThreadPoolExecutor
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = []
+                for i in range(batch_size):
+                    futures.append(
+                        executor.submit(
+                            self._generate_with_api,
+                            system_prompts[i],
+                            texts[i],
+                            images[i],
+                            max_tokens,
+                            temperature
+                        )
+                    )
+                
+                for future in futures:
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        logger.error(f"Batch generation failed for one item: {e}")
+                        results.append("") # Return empty string on failure
+                        
+        elif self.mode == 'vllm':
+            # Use native batch generation for vLLM
+            # Note: _generate_with_vllm currently ignores images
+            from vllm import SamplingParams
+            
+            if any(img is not None for img in images):
+                logger.warning("vLLM mode: image input not fully supported in batch, using text only")
+                
+            sampling_params = SamplingParams(
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            
+            # TODO: Add system prompt handling for vLLM if needed (currently just passing text)
+            outputs = self.llm.generate(texts, sampling_params)
+            results = [output.outputs[0].text.strip() for output in outputs]
+            
+        elif self.mode == 'transformers':
+             # Sequential loop for transformers (safest for now)
+             for i in range(batch_size):
+                 try:
+                     res = self._generate_with_transformers(
+                         system_prompts[i],
+                         texts[i],
+                         images[i],
+                         max_tokens,
+                         temperature
+                     )
+                     results.append(res)
+                 except Exception as e:
+                     logger.error(f"Batch generation failed for item {i}: {e}")
+                     results.append("")
+        
+        elapsed_time = time.time() - start_time
+        logger.info(f"Batch generation of {batch_size} items completed in {elapsed_time:.2f}s")
+        
+        return results
     
     def _generate_with_api(
         self,
         system_prompt: str,
         text: str,
         image: Optional[Union[str, Image.Image, bytes]] = None,
-        max_tokens: int = 512,
+        max_tokens: int = None,
         temperature: float = 0.7,
     ) -> str:
         """使用 API 生成"""
         messages = []
         
         # 构建消息内容
-        if image:
+        if image is not None:
             # 有图片的情况
             image_base64 = self._image_to_base64(image)
             content = [
@@ -289,6 +387,7 @@ class VLMAgent:
         messages.append({"role": "user", "content": content})
         
         # 调用 API（统一入口，兼容多种客户端）
+        
         resp = self._call_chat_completions(self.model_name, messages, temperature, max_tokens)
 
         # 兼容不同返回类型
@@ -302,7 +401,18 @@ class VLMAgent:
         else:
             # object-like response (openai.OpenAI)
             try:
-                return resp.choices[0].message.content.strip()
+                message = resp.choices[0].message
+                content = message.content
+                
+                # Handle case where content is None (e.g. reasoning models or truncation)
+                if content is None:
+                    if hasattr(message, 'reasoning_content') and message.reasoning_content:
+                        # If we have reasoning content, return it (better than nothing)
+                        content = message.reasoning_content
+                    else:
+                        content = ""
+                
+                return content.strip()
             except Exception:
                 # fallback: string
                 return str(resp).strip()
@@ -319,7 +429,7 @@ class VLMAgent:
         from vllm import SamplingParams
         
         # vLLM 目前对多模态的支持可能有限，这里先处理文本
-        if image:
+        if image is not None:
             logger.warning("vLLM mode: image input may not be fully supported, using text only")
         
         sampling_params = SamplingParams(
@@ -338,14 +448,14 @@ class VLMAgent:
         system_prompt: str,
         text: str,
         image: Optional[Union[str, Image.Image, bytes]] = None,
-        max_tokens: int = 512,
+        max_tokens: int = None,
         temperature: float = 0.7,
     ) -> str:
         """使用 transformers 生成"""
         import torch
         
         # 处理图片输入
-        if image:
+        if image is not None:
             # 如果是字符串，尝试加载为图片
             if isinstance(image, str) and os.path.exists(image):
                 image = Image.open(image)
@@ -358,6 +468,8 @@ class VLMAgent:
                     raise ValueError(f"Cannot decode image from string: {image}")
             elif isinstance(image, bytes):
                 image = Image.open(BytesIO(image))
+            elif isinstance(image, np.ndarray):
+                image = Image.fromarray(image.astype('uint8'))
             
             # 处理多模态输入
             inputs = self.processor(

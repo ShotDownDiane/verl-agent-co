@@ -25,7 +25,8 @@ sys.path.append("/root/autodl-tmp/rl4co-urban")
 
 from examples.prompt_agent.llm_agent import LLMAgent
 from functools import partial
-from agent_system.environments.env_package.rl4co.graph_obs import build_obs_stp
+from agent_system.environments.env_package.rl4co.graph_obs import build_obs_stp, render_stp_image
+import base64
 from agent_system.environments.env_package.rl4co.graph_env import GraphWorker
 from agent_system.environments.env_package.rl4co.projection import co_projection_selected
 
@@ -240,7 +241,7 @@ import torch
 import numpy as np
 import traceback
 
-def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
+def run_agent_loop(envs, agent, solution_tour=None, env_name="flp", instance_idx=0):
     """
     SFT 数据生成主循环
     包含：Teacher Forcing, Geometric Injection, Swap-to-Last 策略
@@ -293,6 +294,57 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
                 global_edge_list = edges.T 
             else:
                 global_edge_list = edges
+
+    # C. 获取终端点 (Terminals)
+    terminals_np = np.array([])
+    if hasattr(envs, '_td') and 'terminals' in envs._td.keys():
+        t_data = envs._td['terminals'][0]
+        if isinstance(t_data, torch.Tensor):
+            t_data = t_data.cpu().numpy()
+        
+        # Check if mask or indices
+        # If mask (boolean or 0/1 with size == num_nodes), convert to indices
+        if t_data.ndim == 1 and all_coords is not None and len(t_data) == len(all_coords):
+             terminals_np = np.where(t_data > 0)[0]
+        else:
+             # Assume indices
+             terminals_np = t_data
+
+    # --- Image Generation Logic ---
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_images", "stp")
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. Pure Observation Image (No selected edges, no candidates)
+    pure_obs_path = os.path.join(save_dir, f"instance_{instance_idx}_pure_obs.png")
+    
+    # Ensure we have necessary data for rendering
+    can_render = (all_coords is not None) and (global_edge_list is not None)
+    
+    if can_render:
+        try:
+            # Convert edge list to numpy if needed
+            edge_list_np = global_edge_list
+            if isinstance(edge_list_np, torch.Tensor):
+                edge_list_np = edge_list_np.cpu().numpy()
+                
+            # Convert coords to numpy if needed
+            coords_np = all_coords
+            if isinstance(coords_np, torch.Tensor):
+                coords_np = coords_np.cpu().numpy()
+
+            render_stp_image(
+                locs=coords_np,
+                edge_list=edge_list_np,
+                terminals=terminals_np,
+                selected_edge_indices=[], # Pure obs has no selection
+                top_candidates=[],
+                debug_save_path=pure_obs_path
+            )
+        except Exception as e:
+            print(f"Warning: Failed to render pure obs image: {e}")
+            pure_obs_path = None
+    else:
+        pure_obs_path = None
 
     tour_idx = 0
     i = 0
@@ -485,9 +537,22 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
         
         # 格式化动作字符串，例如 \boxed{A}
         action_str = f"\\boxed{{{chosen_label}}}"
+        action_clean = f"{chosen_label}"
         actions.append(action_str)
-        trajectory.append(action_str)
+        trajectory.append(action_clean)
         obs_list.append(obs_text)
+        
+        # Save image to disk if present
+        img_path = None
+        if img:
+            try:
+                img_data = base64.b64decode(img)
+                img_path = os.path.join(save_dir, f"instance_{instance_idx}_step_{i}.png")
+                with open(img_path, "wb") as f:
+                    f.write(img_data)
+            except Exception as e:
+                print(f"Error saving step image: {e}")
+        
         image_list.append(img)
         solution_tour_list.append(solution_tour)
         
@@ -509,7 +574,36 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
             print("All environments done.")
             break
 
-    return obs_list, image_list, trajectory, candidates_list, all_coords_map
+    # 3. Final Solution Image
+    final_sol_path = os.path.join(save_dir, f"instance_{instance_idx}_final_solution.png")
+    if can_render:
+        try:
+            final_indices = [int(x) for x in solution_tour] if solution_tour is not None else []
+            
+            # Create mask from indices for render_stp_image
+            num_edges = edge_list_np.shape[0]
+            final_mask = np.zeros(num_edges, dtype=int)
+            
+            # Filter valid indices
+            valid_indices = [idx for idx in final_indices if 0 <= idx < num_edges]
+            if valid_indices:
+                final_mask[valid_indices] = 1
+                
+            render_stp_image(
+                locs=coords_np,
+                edge_list=edge_list_np,
+                terminals=terminals_np,
+                selected_edge_indices=final_mask,
+                top_candidates=[],
+                debug_save_path=final_sol_path
+            )
+        except Exception as e:
+            print(f"Warning: Failed to render final solution image: {e}")
+            final_sol_path = None
+    else:
+        final_sol_path = None
+
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map, pure_obs_path, final_sol_path
 
 def main():
     graph_data, routing_data = load_data()
@@ -568,14 +662,18 @@ def main():
             # Ensure generator starts from 0 for the agent loop
             generator.idx = 0
             
-            obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour, env_name=env_name)
-
+            obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_path, final_sol_path = run_agent_loop(worker, agent, solution_tour, env_name=env_name, instance_idx=i)
             json_container.append({
                 "node_coords": node_coords,
+                "edge_list": data[i]['td']["edge_list"],
+                "terminals": data[i]['td']["terminals"],
+                "edge_weights": data[i]['td']["edge_weights"],
                 "trajectory": trajectory,
                 "obs_list": obs_list,
                 "image_list": image_list,
                 "candidates": candidates_list,
+                "pure_obs_image": pure_obs_path,
+                "final_solution_image": final_sol_path,
                 "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
             })
         

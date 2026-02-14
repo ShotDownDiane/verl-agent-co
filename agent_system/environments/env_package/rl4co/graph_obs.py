@@ -6,8 +6,9 @@ from tensordict.tensordict import TensorDict
 from scipy.spatial.distance import cdist, pdist, squareform
 from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
-from typing import List, Any
+from typing import List, Any, Dict
 import numpy as np
+import uuid
 
 def _to_numpy(x: Any):
     if isinstance(x, torch.Tensor):
@@ -22,8 +23,82 @@ def get_label(i: int) -> str:
         # Fallback for > 26: AA, AB... (Simplified to Opt{i} for now or extend logic)
         return f"Opt{i}"
 
+def get_dynamic_thresholds(locs: np.ndarray, k: int = 5) -> List[float]:
+    """
+    Computes adaptive distance thresholds based on Median K-NN distance.
+    Returns [Small_R, Mid_R, Large_R].
+    """
+    num_nodes = locs.shape[0]
+    if num_nodes <= k:
+        # Fallback for very small graphs: sqrt(Area / N) approximation
+        # Assuming unit square coords roughly
+        avg_dist = 1.0 / np.sqrt(num_nodes) if num_nodes > 0 else 1.0
+        return [avg_dist * 0.5, avg_dist * 1.5, avg_dist * 3.0]
 
-def render_flp_image(locs, chosen_indices, top_candidates, img_height=600, debug_save_path=None):
+    # Calculate all pairwise distances
+    dists_matrix = cdist(locs, locs, metric='euclidean')
+    
+    # Sort each row to find the k-th nearest neighbor distance
+    dists_matrix.sort(axis=1)
+    knn_dists = dists_matrix[:, k] # Get the distance to the k-th neighbor
+    
+    # Use median to be robust against outliers
+    sigma = np.median(knn_dists)
+    
+    # Define multipliers: Core (0.5x), Neighborhood (1.5x), Regional (3.0x)
+    return [sigma * 0.5, sigma * 1.5, sigma * 3.0]
+
+def calculate_weighted_heuristic(
+    candidate_idx: int,
+    curr_locs: np.ndarray,
+    uncovered_mask: np.ndarray,
+    thresholds: List[float],    # [Small_R, Mid_R, Large_R]
+    weights: List[float] = [10.0, 3.0, 1.0]
+) -> Dict[str, Any]:
+    """
+    计算加权密度得分。
+    修正点：严格执行覆盖范围截断。超出 thresholds[-1] 的点权重为 0。
+    """
+    # 1. 获取最大覆盖半径 (即我们定义的有效射程)
+    max_radius = thresholds[-1]
+    
+    cand_pos = curr_locs[candidate_idx].reshape(1, 2)
+    target_locs = curr_locs[uncovered_mask]
+    
+    if len(target_locs) == 0:
+        return {"score": 0.0, "counts": [0]*len(weights)}
+    
+    # 2. 计算距离
+    # 注意：这里计算了所有未覆盖点的距离
+    dists = cdist(cand_pos, target_locs, metric='euclidean').flatten()
+    
+    # 3. [关键修正] 预筛选：直接丢弃射程之外的点
+    # 这不仅是逻辑修正，也能提升后续统计的信噪比
+    valid_indices = dists <= max_radius
+    valid_dists = dists[valid_indices]
+    
+    counts = []
+    weighted_score = 0.0
+    prev_th = 0.0
+    
+    # 4. 只在有效范围内进行分桶统计
+    for th, w in zip(thresholds, weights):
+        # 统计环带内的点： prev_th <= d <= th
+        # 由于我们已经过滤掉了 > max_radius 的点，
+        # 最后一个桶会自动收纳所有剩余的有效点
+        in_ring = np.sum((valid_dists >= prev_th) & (valid_dists <= th))
+        
+        weighted_score += in_ring * w
+        counts.append(int(in_ring))
+        
+        prev_th = th
+        
+    return {
+        "score": weighted_score,
+        "counts": counts 
+    }
+
+def render_flp_image(locs, chosen_indices, top_candidates, img_height=336, debug_save_path=None):
     """
     智能双视图渲染 (图层顺序修正版)：
     - 左图：全局视图 + 红框指示器
@@ -69,7 +144,7 @@ def render_flp_image(locs, chosen_indices, top_candidates, img_height=600, debug
 
     # --- 3. 计算全局视图 (Global View) ---
     all_points = locs
-    if top_candidates:
+    if top_candidates is not None and len(top_candidates) > 0:
         cand_coords = np.array([[c['x'], c['y']] for c in top_candidates])
         all_points = np.vstack([locs, cand_coords])
         
@@ -81,7 +156,7 @@ def render_flp_image(locs, chosen_indices, top_candidates, img_height=600, debug
     global_transform, _ = get_transform(g_center, g_span, img_height, padding=50)
 
     # --- 4. 智能聚焦逻辑 ---
-    if top_candidates:
+    if top_candidates is not None and len(top_candidates) > 0:
         cand_points = np.array([[c['x'], c['y']] for c in top_candidates])
         focus_center = np.median(cand_points, axis=0)
         dists = np.linalg.norm(cand_points - focus_center, axis=1)
@@ -109,7 +184,7 @@ def render_flp_image(locs, chosen_indices, top_candidates, img_height=600, debug
             return (x >= vmin[0]-0.1) and (x <= vmax[0]+0.1) and (y >= vmin[1]-0.1) and (y <= vmax[1]+0.1)
 
         # A. 连线
-        if len(chosen_indices) > 0:
+        if len(chosen_indices) > 4:
             chosen_locs = locs[chosen_indices]
             dists = cdist(locs, chosen_locs, metric='euclidean')
             nearest_idx = np.argmin(dists, axis=1)
@@ -243,12 +318,13 @@ def render_flp_image(locs, chosen_indices, top_candidates, img_height=600, debug
     # --- 7. 输出 ---
     _, buffer = cv2.imencode('.png', combined_canvas)
     b64_str = base64.b64encode(buffer).decode('utf-8')
+    img_rgb_np = cv2.cvtColor(combined_canvas, cv2.COLOR_BGR2RGB)
 
     if debug_save_path is not None:
         os.makedirs(os.path.dirname(debug_save_path), exist_ok=True)
         cv2.imwrite(debug_save_path, combined_canvas)
     
-    return b64_str
+    return b64_str, img_rgb_np
 
 def get_diverse_top_k(candidates, dist_matrix, top_k, exclusion_radius=0.08):
     """
@@ -341,95 +417,133 @@ def get_hybrid_top_k(candidates, dist_matrix, k, greedy_ratio=0.6):
     
     return final_selection
 
-def build_obs_flp(td, env_num: int, top_k: int = 10, image_obs: bool = False, given_topk_acts: torch.Tensor = None) -> List[Any]:
+def build_obs_flp(
+    td, 
+    env_num: int, 
+    top_k: int = 10, 
+    image_obs: str = "rgb", # or "base64" or "path"
+    given_topk_acts: torch.Tensor = None
+) -> List[Any]:
     obs_list = []
+    
+    # Ensure tensor for acts exists
     if "topk_acts" not in td.keys():
         td["topk_acts"] = torch.full((env_num, top_k), -1, dtype=torch.long, device=td.device)
 
-    # 1. 提取数据
+    # 1. Extract Data
     locs = _to_numpy(td["locs"])        
     chosen = _to_numpy(td["chosen"])    
     i_step = _to_numpy(td["i"])         
     
-    # 获取目标 K 值
     if "to_choose" in td.keys():
         to_choose = _to_numpy(td["to_choose"])
     else:
         to_choose = np.full((env_num,), 3) # Fallback
 
-    # Initialize tensor to store Top-K candidates for action projection
-    # Shape: (B, K) filled with -1
+    # Initialize storage for Top-K candidates
     action_candidates = torch.full((env_num, top_k), -1, dtype=torch.long, device=td.device)
+    
     if given_topk_acts is not None:
         given_topk_acts = _to_numpy(given_topk_acts)
 
     for idx in range(env_num):
         current_locs = locs[idx]       # (N, 2)
-        current_mask = chosen[idx]     # (N,)
+        current_mask = chosen[idx]     # (N,) 1=Chosen, 0=Unchosen
         step = i_step[idx].item() if hasattr(i_step[idx], "item") else i_step[idx]
         k_target = to_choose[idx].item() if hasattr(to_choose[idx], "item") else to_choose[idx]
         
         num_locs = current_locs.shape[0]
         
-        # --- 2. 状态计算 ---
+        # --- 2. Calculate State & Metrics ---
+        
+        # A. Basic Distance Matrix
         dist_matrix = cdist(current_locs, current_locs, metric='euclidean')
         chosen_indices = np.where(current_mask == 1)[0]
-        
         is_first_step = (len(chosen_indices) == 0)
 
-        # 计算当前状态下的 Cost (Min Dists)
+        # B. Current Cost (Standard FLP Metric)
         if not is_first_step:
             dists_to_chosen = dist_matrix[:, chosen_indices]
-            min_dists = np.min(dists_to_chosen, axis=1) # (N,) 每个点到最近设施的距离
+            min_dists = np.min(dists_to_chosen, axis=1) # Closest facility for each node
             current_total_cost = np.sum(min_dists)
+            # Define 'Uncovered' roughly as nodes far from existing facilities?
+            # Or for P-Median, we weigh all nodes. 
+            # But for Density Score, we prioritize nodes that currently have High Cost.
+            # Simple heuristic: Use ALL nodes for density map, but maybe weigh by current cost?
+            # For simplicity, we stick to pure spatial density for now.
         else:
-            # 第一步，还没选，视为无穷大
             min_dists = np.full(num_locs, np.inf)
             current_total_cost = np.inf
 
-        # 定义一个内部函数来计算收益，避免代码重复
+        # C. [NEW] Dynamic Thresholds for Density Scoring
+        # We calculate this once per step based on the whole map structure
+        density_thresholds = get_dynamic_thresholds(current_locs, k=5)
+        
+        # D. Internal Evaluation Function
         def calc_cand_info(c_idx):
-            # 模拟选了这个点后的新 Cost
+            # 1. Standard Metric: Global Cost Reduction
             dist_to_cand = dist_matrix[:, c_idx]
             new_min_dists = np.minimum(min_dists, dist_to_cand)
             new_total_cost = np.sum(new_min_dists)
+            
+            # 2. [NEW] Density Metric: Weighted Cluster Score
+            # We consider ALL nodes for density calculation in FLP (since all demand matters)
+            # (In MCLP we might mask out covered nodes, but for P-Median all nodes need better service)
+            # To be smarter, we could only count nodes where dist_to_cand < min_dists (Effective Neighbors)
+            # Let's try: Count neighbors, but maybe filter? 
+            # For now, standard spatial density is robust enough for Step 1-5.
+            density_info = calculate_weighted_heuristic(
+                c_idx, 
+                current_locs, 
+                np.ones(num_locs, dtype=bool), # Consider all nodes
+                density_thresholds
+            )
             
             c_info = {
                 "id": int(c_idx),
                 "x": current_locs[c_idx][0],
                 "y": current_locs[c_idx][1],
-                "new_cost": new_total_cost
+                "new_cost": new_total_cost,
+                "density_score": density_info["score"],
+                "density_counts": density_info["counts"] # [Core, Local, Regional]
             }
             
+            # 3. Formulate Description & Sort Value
             if is_first_step:
-                # 第一步：指标是绝对 Cost (越小越好)
+                # Step 1: High Density Score is CRITICAL (The "H" vs "A" logic)
+                # But we still display Cost.
+                # We can construct a hybrid sort value or just stick to Cost for sorting 
+                # but SHOW density to the Agent so it learns.
+                # Let's stick to Cost for the candidate LIST sorting (to align with Solver),
+                # but the Agent will learn to pick the one with High Density from the prompt features.
                 c_info["sort_val"] = new_total_cost 
-                c_info["desc"] = f"Expected Total Distance: {new_total_cost:.2f}"
+                c_info["desc"] = (
+                    f"Global Dist: {new_total_cost:.1f} | "
+                    f"Cluster Score: {density_info['score']:.1f} "
+                    f"(Core Neighbors: {density_info['counts'][0]})"
+                )
             else:
-                # 后续步：指标是 Reduction (越大越好)
                 reduction = current_total_cost - new_total_cost
-                c_info["sort_val"] = -reduction # 负号用于统一升序排序
-                c_info["desc"] = f"Reduces Total Distance by: {reduction:.2f}"
+                c_info["sort_val"] = -reduction
+                c_info["desc"] = (
+                    f"Reduces Dist by: {reduction:.1f} | "
+                    f"Cluster Score: {density_info['score']:.1f} "
+                    f"(Core Neighbors: {density_info['counts'][0]})"
+                )
             return c_info
 
-        # 【分支 A: Injection 模式 (使用给定 acts)】
+        # --- 3. Candidate Selection ---
+
+        # [Branch A: Injection Mode]
         top_candidates = []
         if given_topk_acts is not None:
             indices_to_use = given_topk_acts[idx]
-            
-            # 遍历给定的 ID，按顺序计算 info
             for cand_id in indices_to_use:
-                # 如果是 padding 的 -1，跳过
                 if cand_id == -1: continue
-                
-                # 计算并存入
-                info = calc_cand_info(cand_id)
-                top_candidates.append(info)
-            
-            # 这里不需要再排序，也不需要 diverse filter
-            # 必须严格保留 SFT 数据注入的顺序 (例如最优解在最后)
+                top_candidates.append(calc_cand_info(cand_id))
+            # Keep order strictly
 
-        # 【分支 B: 自动模式 (Greedy Calculation)】
+        # [Branch B: Auto Mode]
         else:
             candidates = []
             unchosen_indices = np.where(current_mask == 0)[0]
@@ -437,89 +551,100 @@ def build_obs_flp(td, env_num: int, top_k: int = 10, image_obs: bool = False, gi
             for cand_idx in unchosen_indices:
                 candidates.append(calc_cand_info(cand_idx))
 
-            # 排序
+            # Primary Sort: Still by Global Cost (Standard Greedy)
+            # The Agent's job is to override this greedy list if it sees a better Density Score
             candidates.sort(key=lambda x: x["sort_val"])
             
-            # 多样性筛选
-            radius_threshold = 0.01
-            top_candidates = get_hybrid_top_k(
-                candidates, 
-                dist_matrix, 
-                top_k
-            )
+            # Simple Top-K (We skip diversity filtering for pure FLP usually, or keep simple)
+            top_candidates = candidates[:top_k]
             
-            # 更新 action_candidates (仅在自动模式下需要回写)
+            # Update action tensor
             indices = [c['id'] for c in top_candidates]
             if indices:
-                # Pad to top_k with -1 if needed
                 valid_len = len(indices)
                 padded_indices = indices + [-1] * (top_k - valid_len)
                 action_candidates[idx] = torch.tensor(padded_indices, device=td.device)
         
-        # --- 5. 可视化 ---
-        # 渲染图像 (Base64 字符串)
-        img_b64 = None
-        debug_path = None
-        # 保持原有调试逻辑：第一个环境每 5 步存一张
-        if idx == 0 and (step == 0 or step % 5 == 0):
-             debug_path = f"./debug_images/flp/env0_step{step}.jpg"
+        # --- 4. Visualization & Prompt Generation ---
         
-        # 如果开启了 image_obs，或者需要保存调试图，就渲染
-        if image_obs or debug_path:
-            img_b64 = render_flp_image(
-                current_locs, 
-                chosen_indices, 
-                top_candidates, 
-                debug_save_path=debug_path
-            )
+        img_b64 = None
+        image_save_path = None 
+        # debug_path = f"./debug_images/flp/env{idx}_step{step}.jpg"
+        if image_obs == "path":
+            uid = uuid.uuid4()
+            image_save_dir = f"/root/autodl-tmp/image/flp/"
+            os.makedirs(image_save_dir, exist_ok=True)
+            image_save_path = f"{image_save_dir}env{idx}_step{step:03d}_{uid}.png"
+        
+        img_b64, img_rgb_np = render_flp_image(
+            current_locs, 
+            chosen_indices, 
+            top_candidates=top_candidates, 
+            debug_save_path=image_save_path
+        )
 
         cand_str_list = []
         for rank, cand in enumerate(top_candidates):
             label = get_label(rank)
             cand_str_list.append(
                 f"Option {label} [Node {cand['id']}]: "
-                f"**{cand['desc']}** " # 加粗收益部分
-                f"(Coords: {cand['x']:.2f}, {cand['y']:.2f})"
+                f"**{cand['desc']}** " 
+                f"(Pos: {cand['x']:.2f}, {cand['y']:.2f})"
             )
         cand_section = "\n".join(cand_str_list)
 
-        # 状态描述
         if is_first_step:
             status_desc = "No facilities open yet."
         else:
             status_desc = (f"Open Facilities: [{', '.join(map(str, chosen_indices))}]\n"
                            f"Current Total Distance: {current_total_cost:.2f}")
 
-        # --- 5. 最终 Obs 组装 ---
+        # --- 5. Final Assembly ---
         obs_text = (
-            f"### Task: Facility Location Problem\n"
-            f"Step: {step + 1} / {k_target}\n" # 人类通常从1开始计数
+            f"### Task: Facility Location Problem (P-Median)\n"
+            f"Step: {step + 1} / {k_target}\n"
             f"Status:\n{status_desc}\n\n"
-            f"### Top {top_k} Candidates Analysis:\n"
-            f"Here are the estimated outcomes for the best available locations:\n"
-            f"{cand_section}\n\n"
+            f"### Top {len(top_candidates)} Candidates Analysis:\n"
+            f"Metric Explainer:\n"
+            f"- **Global Dist**: Standard objective (Total distance from all nodes to nearest facility).\n"
+            f"- **Cluster Score**: Weighted density (High score = Center of a dense cluster).\n"
+            f"- **Core Neighbors**: Number of immediate neighbors within dynamic threshold (R={density_thresholds[0]:.3f}).\n"
+            f"\n{cand_section}\n\n"
             f"### Instruction:\n"
-            f"Select the option that minimizes total distance. Return the Option Label (e.g., A, B, C)."
+            f"Select the option that minimizes total distance.\n"
+            f"Strategy Tip: In early steps, prioritize High Cluster Score (Core Centers) to capture dense demand blocks, "
+            f"even if Global Dist reduction is slightly lower."
+        )
+
+        status_str = (
+            f"Step: {step + 1} / {k_target}\n"
+            f"Status:\n{status_desc}\n\n"
+        )
+
+        candidiates_str = (
+            f"Metric Explainer:\n"
+            f"- **Global Dist**: Standard objective (Total distance from all nodes to nearest facility).\n"
+            f"- **Cluster Score**: Weighted density (High score = Center of a dense cluster).\n"
+            f"- **Core Neighbors**: Number of immediate neighbors within dynamic threshold (R={density_thresholds[0]:.3f}).\n"
+            f"\n{cand_section}\n"
         )
         
-        if image_obs and img_b64:
-            # Return dict if image requested
-            obs_list.append({
-                "text": obs_text,
-                "image": img_b64
-            })
-        else:
-            # Return text only
-            obs_list.append(obs_text)
         
-    # Store candidates in TensorDict for action projection
+        if image_obs == "base64":
+            obs_list.append({"text": obs_text, "image": img_b64, "obs": status_str, "candidates": candidiates_str, "P": k_target})
+        elif image_obs == "path":
+            obs_list.append({"text": obs_text, "image": image_save_path, "obs": status_str, "candidates": candidiates_str, "P": k_target})
+        else:
+            obs_list.append({"text": obs_text, "image": img_rgb_np, "obs": status_str, "candidates": candidiates_str, "P": k_target})
+
     if given_topk_acts is None:
         td["topk_acts"] = action_candidates
-        td["action_candidates"] = action_candidates # 兼容某些旧代码命名
+        td["action_candidates"] = action_candidates 
+        
     return obs_list
 
 
-def render_mclp_image(fac_locs, dem_locs, chosen_indices, top_candidates, radius, img_size=800, debug_save_path=None):
+def render_mclp_image(fac_locs, dem_locs, chosen_indices, top_candidates, radius, img_size=448, debug_save_path=None):
     """
     MCLP 专用渲染：辐射范围视图 (Radiation Range View).
     
@@ -711,18 +836,19 @@ def render_mclp_image(fac_locs, dem_locs, chosen_indices, top_candidates, radius
     # --- 8. 输出 ---
     _, buffer = cv2.imencode('.png', base_canvas)
     b64_str = base64.b64encode(buffer).decode('utf-8')
+    img_rgb_np = cv2.cvtColor(base_canvas, cv2.COLOR_BGR2RGB)
 
     if debug_save_path is not None:
         os.makedirs(os.path.dirname(debug_save_path), exist_ok=True)
         cv2.imwrite(debug_save_path, base_canvas)
     
-    return b64_str
+    return b64_str, img_rgb_np
 
 def build_obs_mclp(
     td, 
     env_num: int, 
     top_k: int = 10, 
-    image_obs: bool = False,
+    image_obs: str = "rgb", # "base64", "path", "rgb"
     given_topk_acts = None
 ) -> List[Any]:
     """
@@ -844,16 +970,27 @@ def build_obs_mclp(
         # --- 5. Visualization ---
         img_b64 = None
         # Debug logic or Image Obs logic
-        debug_path = None
-        if idx == 0 and (step == 0 or step % 5 == 0):
-             debug_path = f"./debug_images/mclp/env0_step{step}.png"
+        image_save_path = None
+        # if idx == 0 and (step == 0 or step % 5 == 0):
+        # debug_path = f"./debug_images/mclp/env0_step{step}.png"
             #  pass
 
-        if image_obs or debug_path:
-            img_b64 = render_mclp_image(
-                current_fac_locs, current_dem_locs, chosen_indices, top_candidates, radius,
-                debug_save_path=debug_path
-            )
+        if image_obs == "path":
+            uid = uuid.uuid4()
+            image_save_dir = f"/root/autodl-tmp/image/mclp/"
+            os.makedirs(image_save_dir, exist_ok=True)
+            image_save_path = f"{image_save_dir}env{idx}_step{step:03d}_{uid}.png"
+            
+        img_b64, img_rgb_np = None, None
+        if image_obs:
+            try:
+                img_b64, img_rgb_np = render_mclp_image(
+                    current_fac_locs, current_dem_locs, chosen_indices, top_candidates, radius,
+                    debug_save_path=image_save_path
+                )
+            except Exception as e:
+                print(f"Warning: MCLP image rendering failed: {e}")
+                img_rgb_np = np.zeros((448, 448, 3), dtype=np.uint8)
 
         # --- 6. Text Prompt ---
         cand_str_list = []
@@ -887,10 +1024,33 @@ def build_obs_mclp(
             f"Select the Option Label that maximizes **Gain**. Return only the Option Label."
         )
 
-        if image_obs and img_b64:
-            obs_list.append({"text": obs_text, "image": img_b64})
-        else:
-            obs_list.append(obs_text)
+        status_str = (
+            f"Step: {step + 1} / {total_steps}\n"
+            f"Status:\n"
+            f"- Open Facilities: [{chosen_str}]\n"
+            f"- Current Coverage: {current_covered_val:.2f} / {total_val:.2f} ({progress_pct:.1f}%)\n"
+        )
+        candidates_str = (
+            f"Refer to the 'Smart Zoom' view (right) for details on the Focus Area (red box in Global View).\n"
+            f"I have analyzed the potential coverage gain for the recommended facilities:\n"
+            f"{cand_section}\n"
+        )
+
+        obs_dict = {
+            "text": obs_text,
+            "obs": status_str,
+            "candidates": candidates_str,
+            "P": total_steps
+        }
+
+        if image_obs == "base64":
+            obs_dict["image"] = img_b64
+        elif image_obs == "path":
+            obs_dict["image"] = image_save_path
+        elif image_obs:
+            obs_dict["image"] = img_rgb_np
+            
+        obs_list.append(obs_dict)
             
     if given_topk_acts is None:
         td["topk_acts"] = action_candidates
@@ -1021,7 +1181,7 @@ def build_obs_mcp(td, env_num: int, top_k: int = 10) -> List[str]:
 
 def render_stp_image(
     locs, edge_list, terminals, selected_edge_indices, top_candidates, 
-    img_height=600, debug_save_path=None
+    img_height=336, debug_save_path=None
 ):
     """
     STP 智能双视图渲染 (Layer Order Fixed & Border Fix).
@@ -1237,18 +1397,19 @@ def render_stp_image(
     # --- 8. 输出 ---
     _, buffer = cv2.imencode('.png', combined_canvas)
     b64_str = base64.b64encode(buffer).decode('utf-8')
+    img_rgb_np = cv2.cvtColor(combined_canvas, cv2.COLOR_BGR2RGB)
 
     if debug_save_path is not None:
         os.makedirs(os.path.dirname(debug_save_path), exist_ok=True)
         cv2.imwrite(debug_save_path, combined_canvas)
     
-    return b64_str
+    return b64_str, img_rgb_np
 
 def build_obs_stp(
     td, 
     env_num: int, 
     top_k: int = 10,
-    image_obs: bool = False,   # 新增
+    image_obs: str = "rgb",   # "path" or "base64"
     given_topk_acts = None
 ) -> List[Any]:
     
@@ -1375,16 +1536,20 @@ def build_obs_stp(
 
         # --- Visualization ---
         img_b64 = None
-        debug_path = None
-        if idx == 0 and (step == 0 or step % 5 == 0):
-             debug_path = f"./debug_images/stp/env0_step{step}.png"
+        image_save_path = None
+        # if idx == 0 and (step == 0 or step % 5 == 0):
+        # debug_path = f"./debug_images/stp/env0_step{step}.png"
             #  pass
-
-        if image_obs or debug_path:
-            img_b64 = render_stp_image(
-                curr_locs, curr_edges, curr_terminals, curr_mask, top_candidates,
-                debug_save_path=debug_path
-            )
+        if image_obs == "path":
+            uid = uuid.uuid4()
+            image_save_dir = f"/root/autodl-tmp/image/stp/"
+            os.makedirs(image_save_dir, exist_ok=True)
+            image_save_path = f"{image_save_dir}env{idx}_step{step:03d}_{uid}.png"
+        
+        img_b64, img_rgb_np = render_stp_image(
+            curr_locs, curr_edges, curr_terminals, curr_mask, top_candidates,
+            debug_save_path=image_save_path
+        )
 
         # --- Text Prompt ---
         cand_str_list = []
@@ -1415,10 +1580,26 @@ def build_obs_stp(
             f"Select the Edge ID (via Option Label) that merges Terminal groups or efficiently extends towards them. Return only the Option Label."
         )
 
-        if image_obs and img_b64:
-            obs_list.append({"text": obs_text, "image": img_b64})
+        status_str = (
+            f"Step: {step}\n"
+            f"Status: {status_line}\n"
+            f"- Connected Terminals: Max group has {max_connected_terminals} / {total_terminals} terminals.\n"
+            f"- Current Total Weight: {current_cost:.2f}\n"
+            f"- Disconnected Groups: {len(term_groups)}\n"
+        )
+
+        candidates_str = (
+            f"Looking at the image, I have marked candidate edges in Green with labels (A, B...).\n"
+            f"I have prioritized edges that merge groups or extend towards other terminals:\n"
+            f"{cand_section}\n"
+        )
+
+        if image_obs == "base64":
+            obs_list.append({"text": obs_text, "image": img_b64, "obs": status_str, "candidates": candidates_str})
+        elif image_obs == "path":
+            obs_list.append({"text": obs_text, "image": image_save_path, "obs": status_str, "candidates": candidates_str})
         else:
-            obs_list.append(obs_text)
+            obs_list.append({"text": obs_text, "image": img_rgb_np, "obs": status_str, "candidates": candidates_str})
         
     if given_topk_acts is None:
         td["topk_acts"] = action_candidates

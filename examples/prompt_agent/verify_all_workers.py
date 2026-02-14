@@ -32,6 +32,9 @@ class TestWorkerJSON(unittest.TestCase):
             'topk_acts': [torch.tensor([0, 1, 2])], # List of tensors or tensor
             'current_node': torch.tensor([0]) # Current node index
         }
+        
+        # Mock create_envs to return self.envs (so reset/step are called on it)
+        self.envs.create_envs.return_value = self.envs
 
     def test_flp_worker(self):
         from Qwen3_single_worker_flp import run_agent_loop
@@ -49,9 +52,12 @@ class TestWorkerJSON(unittest.TestCase):
              (mock_obs, torch.tensor([1.0]), torch.tensor([True]), {})
         ]
 
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2])
+        obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_path, final_sol_path = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2], instance_idx=0)
         self.assertIsInstance(node_coords, dict)
         self.assertTrue(len(candidates_list) > 0, "Candidates list should not be empty")
+        # Check new images paths
+        # They might be None if render failed (e.g. cv2 issue in mock environment) or if coords are missing
+        # But we expect the return values to be unpacked correctly.
 
     def test_tsp_worker(self):
         from Qwen3_single_worker_tsp import run_agent_loop
@@ -71,7 +77,7 @@ class TestWorkerJSON(unittest.TestCase):
             (mock_obs, torch.tensor([1.0]), torch.tensor([True]), {})
         ]
 
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2])
+        obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_path, final_sol_path = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2], instance_idx=0)
         
         self.assertIsInstance(node_coords, dict)
         self.assertTrue(len(node_coords) > 0)
@@ -86,6 +92,10 @@ class TestWorkerJSON(unittest.TestCase):
         
         self.envs._td = {
             'locs': torch.randn(1, 10, 2),
+            'demand': torch.rand(1, 10),
+            'vehicle_capacity': torch.tensor([1.0]),
+            'used_capacity': torch.tensor([0.0]),
+            'action_mask': torch.zeros(1, 10),
             'topk_acts': [torch.tensor([0, 1, 2])],
             'current_node': torch.tensor([0])
         }
@@ -96,7 +106,7 @@ class TestWorkerJSON(unittest.TestCase):
              (mock_obs, torch.tensor([1.0]), torch.tensor([True]), {})
         ]
         
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2])
+        obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs, final_sol = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2], instance_idx=0)
         self.assertIsInstance(node_coords, dict)
         self.assertTrue(len(candidates_list) > 0, "Candidates list should not be empty")
 
@@ -107,7 +117,9 @@ class TestWorkerJSON(unittest.TestCase):
         # MCLP might use facility_locs
         self.envs._td = {
             'facility_locs': torch.randn(1, 10, 2),
-            'topk_acts': [torch.tensor([0, 1, 2])]
+            'demand_locs': torch.randn(1, 10, 2),
+            'topk_acts': [torch.tensor([0, 1, 2])],
+            'coverage_radius': torch.tensor([0.1])
         }
         
         mock_obs = {0: {'text': "observation text", 'image': None}}
@@ -116,7 +128,7 @@ class TestWorkerJSON(unittest.TestCase):
              (mock_obs, torch.tensor([1.0]), torch.tensor([True]), {})
         ]
 
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2])
+        obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_path, final_sol_path = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2], instance_idx=0)
         self.assertIsInstance(node_coords, dict)
         self.assertTrue(len(candidates_list) > 0, "Candidates list should not be empty")
 
@@ -126,7 +138,9 @@ class TestWorkerJSON(unittest.TestCase):
         
         self.envs._td = {
             'locs': torch.randn(1, 10, 2),
-            'topk_acts': [torch.tensor([0, 1, 2])]
+            'topk_acts': [torch.tensor([0, 1, 2])],
+            'terminals': torch.tensor([0, 1, 0, 0, 1, 0, 0, 0, 0, 0]), # Mask style
+            'edge_index': torch.tensor([[0, 1], [1, 2], [2, 3], [3, 4], [4, 5]]).T # (2, E)
         }
         
         mock_obs = {0: {'text': "observation text", 'image': None}}
@@ -135,7 +149,7 @@ class TestWorkerJSON(unittest.TestCase):
              (mock_obs, torch.tensor([1.0]), torch.tensor([True]), {})
         ]
 
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2])
+        obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_path, final_sol_path = run_agent_loop(self.envs, self.agent, solution_tour=[0,1,2], instance_idx=0)
         self.assertIsInstance(node_coords, dict)
         self.assertTrue(len(candidates_list) > 0, "Candidates list should not be empty")
 

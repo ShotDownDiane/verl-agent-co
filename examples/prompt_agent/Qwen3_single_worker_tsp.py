@@ -4,6 +4,7 @@ import pickle
 import torch
 import numpy as np
 import re
+import base64
 from types import SimpleNamespace
 from omegaconf import OmegaConf
 import ray
@@ -24,7 +25,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../"
 from agent_system.environments.env_manager import make_envs
 from examples.prompt_agent.llm_agent import LLMAgent
 from functools import partial
-from agent_system.environments.env_package.rl4co.route_obs import build_obs_tsp
+from agent_system.environments.env_package.rl4co.route_obs import build_obs_tsp, render_tsp_smart_dual_view
 from agent_system.environments.env_package.rl4co.route_envs import RouteWorker
 from agent_system.environments.env_manager import RouteEnvironmentManager
 from agent_system.environments.env_package.rl4co.projection import co_projection_selected
@@ -174,7 +175,7 @@ import torch
 import numpy as np
 import traceback
 
-def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
+def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp", instance_idx=0):
     # print(f"Resetting environments...")
     obs, infos = envs.reset()
     trajectory = []
@@ -183,6 +184,10 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
     image_list = []
     candidates_list = []
     
+    # Create debug directory
+    debug_dir = f"debug_images/{env_name}"
+    os.makedirs(debug_dir, exist_ok=True)
+
     # =========================================================================
     # 1. 获取全局坐标 (用于计算几何距离)
     # =========================================================================
@@ -200,13 +205,59 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
                 temp_coords = temp_coords.cpu().numpy()
             for idx, coord in enumerate(temp_coords):
                 all_coords_map[int(idx)] = coord.tolist()
+    
+    # --- 0. 生成纯 Observation 图片 (No Candidates) ---
+    pure_obs_image_path = None
+    if all_coords is not None:
+        try:
+            # Ensure numpy
+            coords_np = all_coords
+            if isinstance(coords_np, torch.Tensor):
+                coords_np = coords_np.cpu().numpy()
             
+            num_loc = coords_np.shape[0]
+            visited_mask = np.zeros(num_loc, dtype=bool)
+            
+            start_node = 0
+            if solution_tour is not None and len(solution_tour) > 0:
+                start_node = int(solution_tour[0])
+            
+            visited_mask[start_node] = True
+            path_history = [start_node]
+            
+            save_path = os.path.join(debug_dir, f"inst_{instance_idx}_pure_obs.png")
+            
+            render_tsp_smart_dual_view(
+                locs=coords_np,
+                visited_mask=visited_mask,
+                current_node_idx=start_node,
+                path_history=path_history,
+                top_candidates=[],
+                img_height=600,
+                debug_save_path=save_path
+            )
+            pure_obs_image_path = save_path
+        except Exception as e:
+            print(f"Error generating pure obs image: {e}")
+            # import traceback
+            # traceback.print_exc()
+
     tour_idx = 0
     i = 0
     
     while True:
         # print(f"\n--- Step {i+1} ---")
         obs_text, img = obs[0]['text'], obs[0]['image']
+
+        # Save step image if it exists and is a base64 string
+        if img and isinstance(img, str) and len(img) > 100:
+             try:
+                 step_img_path = os.path.join(debug_dir, f"inst_{instance_idx}_step_{i}.png")
+                 img_data = base64.b64decode(img)
+                 with open(step_img_path, "wb") as f:
+                     f.write(img_data)
+             except Exception as e:
+                 print(f"Error saving step image: {e}")
 
         actions = []
         
@@ -334,9 +385,11 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
         
         # Format action for projection
         action_str = f"\\boxed{{{chosen_label}}}"
+        action_clean = f"{chosen_label}"
+        
         print(f"Action: {action_str}")
         actions.append(action_str)
-        trajectory.append(action_str)
+        trajectory.append(action_clean)
         obs_list.append(obs_text)
         image_list.append(img)
         solution_tour_list.append(solution_tour)
@@ -352,7 +405,38 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="cvrp"):
             # print("All environments done.")
             break
             
-    return obs_list, image_list, trajectory, candidates_list, all_coords_map
+    # --- Generate Final Solution Image ---
+    final_solution_image_path = None
+    if all_coords is not None and solution_tour is not None:
+        try:
+            # Ensure numpy
+            coords_np = all_coords
+            if isinstance(coords_np, torch.Tensor):
+                coords_np = coords_np.cpu().numpy()
+            
+            num_loc = coords_np.shape[0]
+            visited_mask = np.ones(num_loc, dtype=bool)
+            
+            # Use solution tour for history
+            path_history = [int(x) for x in solution_tour]
+            current_node_idx = path_history[-1]
+            
+            save_path = os.path.join(debug_dir, f"inst_{instance_idx}_final_solution.png")
+            
+            render_tsp_smart_dual_view(
+                locs=coords_np,
+                visited_mask=visited_mask,
+                current_node_idx=current_node_idx,
+                path_history=path_history,
+                top_candidates=[],
+                img_height=600,
+                debug_save_path=save_path
+            )
+            final_solution_image_path = save_path
+        except Exception as e:
+            print(f"Error generating final solution image: {e}")
+
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map, pure_obs_image_path, final_solution_image_path
 
 def main():
     _, routing_data = load_data()
@@ -370,7 +454,7 @@ def main():
     print("="*50)
 
     tsp_data = routing_data['tsp']
-    n = 1#len(tsp_data)
+    n = len(tsp_data)
     json_container = []
 
     for i in range(n):
@@ -403,7 +487,7 @@ def main():
         # Ensure generator starts from 0 for the agent loop
         generator.idx = 0
         
-        obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour, env_name="tsp")
+        obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_path, final_sol_path = run_agent_loop(worker, agent, solution_tour, env_name="tsp", instance_idx=i)
 
         json_container.append({
             "node_coords": node_coords,
@@ -411,7 +495,9 @@ def main():
             "obs_list": obs_list,
             "image_list": image_list,
             "candidates": candidates_list,
-            "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
+            "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else [],
+            "pure_obs_image_path": pure_obs_path,
+            "final_solution_image_path": final_sol_path
         })
     
     with open("tsp_agent_output.json", "w") as f:

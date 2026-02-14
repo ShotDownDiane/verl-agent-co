@@ -25,7 +25,8 @@ sys.path.append("/root/autodl-tmp/rl4co-urban")
 
 from examples.prompt_agent.llm_agent import LLMAgent
 from functools import partial
-from agent_system.environments.env_package.rl4co.graph_obs import build_obs_mclp
+import base64
+from agent_system.environments.env_package.rl4co.graph_obs import build_obs_mclp, render_mclp_image
 from agent_system.environments.env_package.rl4co.graph_env import GraphWorker
 from agent_system.environments.env_package.rl4co.projection import co_projection_selected
 from agent_system.environments.env_package.rl4co.graph_obs import get_label
@@ -235,7 +236,7 @@ import torch
 import numpy as np
 import traceback
 
-def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
+def run_agent_loop(envs, agent, solution_tour=None, env_name="flp", instance_idx=0):
     """
     SFT 数据生成主循环
     包含：Teacher Forcing, Geometric Injection, Swap-to-Last 策略
@@ -248,6 +249,36 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
     solution_tour_list = []
     image_list = []
     candidates_list = []
+    
+    # --- Image Generation Logic ---
+    save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_images", "mclp")
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # 1. Extract Data for Rendering
+    if hasattr(envs, '_td'):
+        fac_locs_np = envs._td['facility_locs'][0].cpu().numpy()
+        dem_locs_np = envs._td['demand_locs'][0].cpu().numpy() if 'demand_locs' in envs._td.keys() else envs._td['locs'][0].cpu().numpy()
+        radius = envs._td['coverage_radius'][0].item() if 'coverage_radius' in envs._td.keys() else 0.1
+    else:
+        # Fallback
+        fac_locs_np = np.zeros((0, 2))
+        dem_locs_np = np.zeros((0, 2))
+        radius = 0.1
+
+    # 2. Pure Observation Image (No candidates, no chosen)
+    pure_obs_path = os.path.join(save_dir, f"instance_{instance_idx}_pure_obs.png")
+    try:
+        render_mclp_image(
+            fac_locs=fac_locs_np,
+            dem_locs=dem_locs_np,
+            chosen_indices=[],
+            top_candidates=[],
+            radius=radius,
+            debug_save_path=pure_obs_path
+        )
+    except Exception as e:
+        print(f"Warning: Failed to render pure obs image: {e}")
+        pure_obs_path = None
     
     # =========================================================================
     # 1. 静态数据准备 (坐标 & 边列表)
@@ -454,9 +485,10 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
                 chosen_label = "0"
         
         # 格式化动作字符串，例如 \boxed{A}
+        action_clean = f"{chosen_label}"
         action_str = f"\\boxed{{{chosen_label}}}"
         actions.append(action_str)
-        trajectory.append(action_str)
+        trajectory.append(action_clean)
         obs_list.append(obs_text)
         image_list.append(img)
         solution_tour_list.append(solution_tour)
@@ -479,7 +511,23 @@ def run_agent_loop(envs, agent, solution_tour=None, env_name="flp"):
             print("All environments done.")
             break
 
-    return obs_list, image_list, trajectory, candidates_list, all_coords_map
+    # 3. Final Solution Image
+    final_sol_path = os.path.join(save_dir, f"instance_{instance_idx}_final_solution.png")
+    try:
+        final_indices = [int(x) for x in solution_tour] if solution_tour is not None else []
+        render_mclp_image(
+            fac_locs=fac_locs_np,
+            dem_locs=dem_locs_np,
+            chosen_indices=final_indices,
+            top_candidates=[],
+            radius=radius,
+            debug_save_path=final_sol_path
+        )
+    except Exception as e:
+        print(f"Warning: Failed to render final solution image: {e}")
+        final_sol_path = None
+
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map, pure_obs_path, final_sol_path
 
 def main():
     graph_data, routing_data = load_data()
@@ -538,7 +586,7 @@ def main():
             # Ensure generator starts from 0 for the agent loop
             generator.idx = 0
             
-            obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour, env_name=env_name)
+            obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_path, final_sol_path = run_agent_loop(worker, agent, solution_tour, env_name=env_name, instance_idx=i)
 
             json_container.append({
                 "node_coords": node_coords,
@@ -546,6 +594,8 @@ def main():
                 "obs_list": obs_list,
                 "image_list": image_list,
                 "candidates": candidates_list,
+                "pure_obs_image_path": pure_obs_path,
+                "final_solution_image_path": final_sol_path,
                 "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
             })
         

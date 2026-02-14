@@ -5,6 +5,7 @@ import torch
 import numpy as np
 import re
 import traceback
+import base64
 from types import SimpleNamespace
 from omegaconf import OmegaConf
 import ray
@@ -232,19 +233,20 @@ def get_solution_from_data(data_item):
     print("Warning: No explicit solution tour found in data item.")
     return None
 
-def run_agent_loop(worker, agent, solution_tour, env_name='flp'):
-    envs = worker.env if hasattr(worker, 'env') else worker
+def run_agent_loop(envs, agent, solution_tour=None, env_name='flp', instance_idx=0):
+    """
+    Run the agent loop for a single instance.
+    """
+    # Initialize Environment
+    obs, infos = envs.reset()
     
-    # Reset Environment
-    obs, _ = envs.reset()
-    
-    # Prepare Data Storage
+    # Init storage
     steps_data = []
+    actions = []
     
-    # A. 获取全局坐标 (所有环境共享/或单实例)
-    # 假设 batch_size=1，直接取第0个
+    # 尝试从 envs._td 中提取坐标
+    all_coords = None
     all_coords_map = {}
-    all_coords = None # For legacy injection logic compatibility
     
     # 尝试从 envs._td 中提取坐标
     if hasattr(envs, '_td'):
@@ -266,8 +268,38 @@ def run_agent_loop(worker, agent, solution_tour, env_name='flp'):
             for idx, coord in enumerate(temp_coords):
                 all_coords_map[int(idx)] = coord.tolist()
 
+    # Create debug directory
+    debug_dir = f"debug_images/{env_name}"
+    os.makedirs(debug_dir, exist_ok=True)
+
+    # --- 0. 生成纯 Observation 图片 (No Candidates) ---
+    pure_obs_image_path = None
+    if all_coords is not None:
+        try:
+            # Ensure numpy
+            coords_np = all_coords
+            if isinstance(coords_np, torch.Tensor):
+                coords_np = coords_np.cpu().numpy()
+            
+            save_path = os.path.join(debug_dir, f"inst_{instance_idx}_pure_obs.png")
+            # Render with no chosen indices and no candidates
+            render_flp_image(
+                locs=coords_np,
+                chosen_indices=[],
+                top_candidates=[],
+                img_height=600,
+                debug_save_path=save_path
+            )
+            pure_obs_image_path = save_path
+        except Exception as e:
+            print(f"Error generating pure obs image: {e}")
+            traceback.print_exc()
+
     tour_idx = 0
     i = 0
+    
+    # Track chosen indices for Final Solution Image
+    agent_chosen_indices = []
     
     # =========================================================================
     # 2. 交互主循环
@@ -412,14 +444,31 @@ def run_agent_loop(worker, agent, solution_tour, env_name='flp'):
         
         # 格式化动作字符串，例如 \boxed{A}
         action_str = f"\\boxed{{{chosen_label}}}"
+        action_clean = f"{chosen_label}"
         actions.append(action_str)
         
+        # Track chosen index
+        if len(chosen_label) == 1 and 'A' <= chosen_label <= 'Z':
+             idx_in_list = ord(chosen_label) - ord('A')
+             if idx_in_list < len(candidates_list):
+                 agent_chosen_indices.append(candidates_list[idx_in_list])
+        
+        # Save step image if it exists and is a base64 string
+        if img and isinstance(img, str) and len(img) > 100: # Simple check if it looks like base64
+             try:
+                 step_img_path = os.path.join(debug_dir, f"inst_{instance_idx}_step_{i}.png")
+                 img_data = base64.b64decode(img)
+                 with open(step_img_path, "wb") as f:
+                     f.write(img_data)
+             except Exception as e:
+                 print(f"Error saving step image: {e}")
+
         # Store Step Data (New Format)
         step_record = {
             "step_idx": i,
             "obs": obs_text,
             "image": img, # Base64 string
-            "trajectory": action_str,
+            "trajectory": action_clean,
             "candidates": candidates_list,
             "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
         }
@@ -446,7 +495,29 @@ def run_agent_loop(worker, agent, solution_tour, env_name='flp'):
     image_list = [s['image'] for s in steps_data]
     candidates_list = [s['candidates'] for s in steps_data]
 
-    return obs_list, image_list, trajectory, candidates_list, all_coords_map
+    # --- Generate Final Solution Image ---
+    final_solution_image_path = None
+    if all_coords is not None:
+        try:
+             # Ensure numpy
+             coords_np = all_coords
+             if isinstance(coords_np, torch.Tensor):
+                 coords_np = coords_np.cpu().numpy()
+             
+             save_path = os.path.join(debug_dir, f"inst_{instance_idx}_final_solution.png")
+             render_flp_image(
+                 locs=coords_np,
+                 chosen_indices=agent_chosen_indices,
+                 top_candidates=[],
+                 img_height=600,
+                 debug_save_path=save_path
+             )
+             final_solution_image_path = save_path
+        except Exception as e:
+            print(f"Error generating final solution image: {e}")
+            traceback.print_exc()
+
+    return obs_list, image_list, trajectory, candidates_list, all_coords_map, pure_obs_image_path, final_solution_image_path
 
 def main():
     graph_data, routing_data = load_data()
@@ -465,7 +536,7 @@ def main():
 
     # Environments to process
     target_envs = ['flp']
-
+    
     for env_name in target_envs:
         if env_name not in graph_data:
             print(f"Skipping {env_name} (not in graph_data)")
@@ -473,7 +544,7 @@ def main():
             
         print(f"\n>>> Running Environment: {env_name}")
         data = graph_data[env_name] 
-        n = 1#len(data)
+        n = len(data)
         
         # Limit to first item for testing as per original code structure
         # Or iterate all if intended. The original code looped i in range(n)
@@ -505,7 +576,7 @@ def main():
             # Ensure generator starts from 0 for the agent loop
             generator.idx = 0
             
-            obs_list, image_list, trajectory, candidates_list, node_coords = run_agent_loop(worker, agent, solution_tour, env_name=env_name)
+            obs_list, image_list, trajectory, candidates_list, node_coords, pure_obs_image_path, final_solution_image_path = run_agent_loop(worker, agent, solution_tour, env_name=env_name, instance_idx=i)
 
             json_container.append({
                 "node_coords": node_coords,
@@ -513,7 +584,9 @@ def main():
                 "obs_list": obs_list,
                 "image_list": image_list,
                 "candidates": candidates_list,
-                "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else []
+                "solution_tour": [int(x) for x in solution_tour] if solution_tour is not None else [],
+                "pure_obs_image_path": pure_obs_image_path,
+                "final_solution_image_path": final_solution_image_path
             })
         
         with open(f"{env_name}_agent_output.json", "w") as f:

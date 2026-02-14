@@ -45,8 +45,8 @@ class GraphWorker(BaseCOWorker):
         device: str = "cpu",
         num_loc: int = 20, # Default for graph envs if needed
         return_topk_options: int = 0,
-        image_obs: bool = False,
         env_kwargs: Optional[Dict[str, Any]] = None,
+        image_obs: str = "rgb", # or "base64" "path"
     ):
         self.num_loc = num_loc
         self.image_obs = image_obs
@@ -77,23 +77,23 @@ class GraphWorker(BaseCOWorker):
 
         # Prepare generator params
         # Some graph envs (like FLP, MCLP) use num_loc/num_nodes
-        # We try to pass them if available in self.num_loc or env_kwargs
         generator_params = {}
         if self.num_loc is not None:
-             # Common param name. Note: Specific envs might use 'num_cust', 'num_nodes' etc.
-             # RL4CO usually standardizes on generator_params
-             # For now we put it in generic 'num_loc' and hope the env generator handles it or we map it.
-             # Actually, let's look at RouteWorker. It sets 'num_loc'.
              generator_params["num_loc"] = self.num_loc
 
-        # Merge with any extra generator params from env_kwargs
-        generator = None
-        if self.env_kwargs and "generator_params" in self.env_kwargs:
-            generator_params.update(self.env_kwargs["generator_params"])
-            if generator is None and "generator" in generator_params:
-                generator = generator_params.pop("generator")
-        elif 'generator' in kwargs:
-            generator = kwargs.pop('generator')
+        # Merge with any extra generator params from kwargs (popping to avoid duplication)
+        if 'generator_params' in kwargs:
+            generator_params.update(kwargs.pop('generator_params'))
+            
+        # Also check self.env_kwargs as a fallback or for non-popped access (though kwargs should cover it)
+        # But if we rely on kwargs, we should be fine.
+        
+        # Extract generator
+        generator = kwargs.pop('generator', None)
+        
+        # Legacy: check if generator is inside generator_params
+        if generator is None and "generator" in generator_params:
+            generator = generator_params.pop("generator")
 
         # Initialize environment
         return env_cls(
@@ -171,6 +171,12 @@ class GraphEnvs(BaseCOEnvs):
             worker_env_kwargs["generator_params"] = worker_env_kwargs["generator_params"].copy()
             worker_env_kwargs["generator_params"]["num_loc"] = current_num_loc
 
+        # Handle list-based generator in env_kwargs (e.g. for batch processing with different data per worker)
+        if "generator" in env_kwargs and isinstance(env_kwargs["generator"], list):
+            worker_env_kwargs["generator"] = env_kwargs["generator"][worker_idx]
+
+        image_obs = env_kwargs.get("image_obs", "rgb")
+
         # args matching GraphWorker.__init__ signature
         args = (
             env_name, 
@@ -179,7 +185,8 @@ class GraphEnvs(BaseCOEnvs):
             device, 
             current_num_loc, 
             return_topk_options, 
-            worker_env_kwargs
+            worker_env_kwargs,
+            image_obs
         )
         return args, {}
 

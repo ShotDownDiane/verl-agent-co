@@ -2,6 +2,8 @@
 **/*.png
 **/*.tsp
 **/*.pt
+**/*.csv
+**/*.pdf
 **/checkpoints
 **/wget-log
 **/_build/
@@ -14,6 +16,10 @@
 **/*.pth
 checkpoint/
 examples/prompt_agent/cot/
+env/tdtsp/data
+env/tdvrp/data
+scripts/test
+example/prompt_agent/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

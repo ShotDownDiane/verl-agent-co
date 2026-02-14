@@ -35,45 +35,79 @@ def co_projection(
 
     return parsed_actions, valids
 
+import re
+from typing import List, Tuple
+
 def co_projection_selected(
     actions: List[str],
     env_name: str | None = None
 ) -> Tuple[List[int], List[int]]:
     """
-    Parse text actions based on the specific mode.
+    Parse text actions with strict structural validation.
+    
+    Criteria for valid=1:
+    1. Must contain <Observation>...</Observation> block.
+    2. Must contain <Thought>...</Thought> block.
+    3. Must contain <Decision>...</Decision> block.
+    4. The <Decision> block must contain \boxed{X}.
+    5. X must be a valid single uppercase letter.
     """
     valids: List[int] = []
     parsed_actions: List[int] = []
+    
+    # 定义提取 Decision 块的正则（支持跨行）
+    decision_block_pattern = re.compile(r"<Decision>(.*?)</Decision>", re.DOTALL | re.IGNORECASE)
+    # 定义提取 boxed 内容的正则
+    box_pattern = re.compile(r"\\boxed\{([^{}]*)\}")
 
     for a in actions:
-        s = a.strip()
-        m = re.search(r"\\boxed\{([^{}]*)\}", s)
-        
-        # 1. 如果没找到 box，直接判错
-        if not m:
+        # --- 1. 结构完整性检查 (三段式验证) ---
+        # 必须同时包含三个核心标签对
+        has_obs = "<Observation>" in a and "</Observation>" in a
+        has_thought = "<Thought>" in a and "</Thought>" in a
+        # Decision 标签将在下面通过正则严格提取，这里先做简单检查
+        has_decision_tags = "<Decision>" in a and "</Decision>" in a
+
+        if not (has_obs and has_thought and has_decision_tags):
             parsed_actions.append(0)
             valids.append(0)
             continue
 
-        content = m.group(1).strip()
+        # --- 2. 提取 Decision 块内容 ---
+        # 我们只从 Decision 标签内部提取答案，防止模型在 Thought 里幻觉出 \boxed{}
+        decision_match = decision_block_pattern.search(a)
         
-        # --- 模式 A: 解析选项 (A/B/C -> 0/1/2) ---
-        # 清理可能的 "Option A", "Choice B" 等前缀
+        if not decision_match:
+            parsed_actions.append(0)
+            valids.append(0)
+            continue
+            
+        decision_content = decision_match.group(1).strip()
+
+        # --- 3. 提取 Boxed 答案 ---
+        box_match = box_pattern.search(decision_content)
+        
+        if not box_match:
+            parsed_actions.append(0)
+            valids.append(0)
+            continue
+
+        content = box_match.group(1).strip()
+        
+        # --- 4. 解析选项 (A -> 0, B -> 1) ---
+        # 清理可能的前缀 (虽然 boxed 内通常很干净)
         clean_content = re.sub(r"^(Option|Choice)\s+", "", content, flags=re.IGNORECASE).strip()
-        
-        # 严格限制只能是单个字母
+
         if len(clean_content) == 1 and clean_content.isalpha():
-            idx = ord(clean_content) - 65  # A=0, B=1...
-            if 0 <= idx < 50:
+            # 强制转换为大写，处理 'a' 的情况
+            idx = ord(clean_content.upper()) - 65 
+            if 0 <= idx < 50: # 假设最多50个选项，防止异常字符
                 parsed_actions.append(idx)
-                valids.append(1)
+                valids.append(1) # 只有闯过所有关卡，这里才给 1
             else:
-                
-                # 字母超出合理范围
                 parsed_actions.append(0)
                 valids.append(0)
         else:
-            # 解析失败 (例如输出了 "A and B" 或 "Node 1")
             parsed_actions.append(0)
             valids.append(0)
 

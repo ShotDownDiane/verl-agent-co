@@ -208,41 +208,78 @@ class LLMAgent:
         
         return result
     
+    from typing import Union, List, Dict, Optional
+
     def _generate_with_api(
         self,
         text: Union[str, List[Dict[str, str]]],
-        max_tokens: int = 512,
-        temperature: float = 1,
+        max_tokens: int = 4096,  # <--- [修改1] 默认为 4096，防止 CoT 写到一半被截断
+        temperature: float = 0.5, # <--- [建议] 稍微降低温度，逻辑任务更稳
         system_prompt: Optional[str] = None,
     ) -> str:
-        """使用 API 生成"""
-        # 构建消息列表
-        messages = []
+        """使用 API 生成 (修复版)"""
         
+        # 1. 构建消息列表
+        messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         
         if isinstance(text, str):
             messages.append({"role": "user", "content": text})
         elif isinstance(text, list):
-            # 已经是消息列表格式
             messages.extend(text)
         else:
             raise ValueError(f"Unsupported text type: {type(text)}")
         
-        # 调用 API
-        resp = self._call_chat_completions(self.model_name, messages, temperature, max_tokens)
+        try:
+            # 2. 调用 API
+            resp = self._call_chat_completions(self.model_name, messages, temperature, max_tokens)
 
-        if isinstance(resp, dict):
-            try:
-                return resp["choices"][0]["message"]["content"].strip()
-            except Exception:
-                return resp["choices"][0].get("text", "").strip()
-        else:
-            try:
-                return resp.choices[0].message.content.strip()
-            except Exception:
-                return str(resp).strip()
+            # 3. 解析响应 (兼容 Object 和 Dict)
+            choice = None
+            message = None
+            finish_reason = None
+            
+            # 判断是 Pydantic 对象 还是 字典
+            if isinstance(resp, dict):
+                choice = resp["choices"][0]
+                message = choice["message"]
+                finish_reason = choice.get("finish_reason")
+                
+                # 提取内容
+                content = message.get("content")
+                # 尝试提取思维链 (DeepSeek/GLM 等模型可能把内容放在这里)
+                reasoning = message.get("reasoning_content") 
+            else:
+                # 假设是 Object (如 OpenAI Python SDK v1+)
+                choice = resp.choices[0]
+                message = choice.message
+                finish_reason = getattr(choice, "finish_reason", None)
+                
+                # 提取内容 (使用 getattr 防止属性不存在报错)
+                content = getattr(message, "content", None)
+                reasoning = getattr(message, "reasoning_content", None)
+
+            # 4. [关键挽救逻辑] 截断警告
+            if finish_reason == "length":
+                print(f"[Warning] Response truncated! (Max tokens hit: {max_tokens})")
+
+            # 5. [核心修复] 优先返回 Content，如果为 None 则尝试返回 Reasoning
+            # 很多推理模型在截断时 content 会是 None，导致原来的代码报错或打印对象
+            if content is not None and str(content).strip():
+                return str(content).strip()
+            
+            if reasoning is not None and str(reasoning).strip():
+                print("[Info] Content is empty, returning reasoning_content (Draft).")
+                return str(reasoning).strip()
+
+            # 6. 如果实在是空的 (罕见情况)
+            return ""
+
+        except Exception as e:
+            print(f"API Generation Error: {e}")
+            # 绝对不要返回 str(resp)，否则就会出现你刚才看到的那个巨大的对象字符串
+            return ""
     
     def _generate_with_vllm(
         self,
