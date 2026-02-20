@@ -6,6 +6,7 @@ export interface Node {
     x: number;
     y: number;
     demand: number;
+    time_window?: [number, number];
 }
 
 export interface State {
@@ -16,4 +17,5 @@ export interface State {
     remaining_capacity: number;
     mode: "real" | "virtual";
     logs: string[];
+    text_prompt: string;
 }

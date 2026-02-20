@@ -87,25 +87,29 @@ function App() {
     };
 
     return (
-        <div className="flex h-screen w-screen overflow-hidden bg-gray-100">
-            {/* Left Panel: Map (60%) */}
-            <div className="w-[60%] h-full relative border-r border-gray-300 shadow-lg z-10">
-                <MapPanel 
-                    state={state} 
-                    mode={viewMode} 
-                    onNodeClick={handleNodeClick} 
-                />
+        <div className="flex h-screen w-screen overflow-hidden bg-gray-50">
+            {/* Left Panel: Map (60%) - Added rounded corners and margin for floating effect */}
+            <div className="flex-1 h-full p-4 pr-2">
+                <div className="h-full w-full relative rounded-3xl overflow-hidden shadow-2xl border border-gray-200 bg-white">
+                    <MapPanel 
+                        state={state} 
+                        mode={viewMode} 
+                        onNodeClick={handleNodeClick} 
+                    />
+                </div>
             </div>
 
-            {/* Right Panel: Chat/Control (40%) */}
-            <div className="w-[40%] h-full">
-                <ChatPanel 
-                    state={state ? { ...state, mode: viewMode } : null} 
-                    onReset={handleReset}
-                    onToggleMode={handleToggleMode}
-                    onPredict={handlePredict}
-                    isPredicting={isPredicting}
-                />
+            {/* Right Panel: Chat/Control (40%) - Floating card style */}
+            <div className="w-[450px] h-full p-4 pl-2 flex flex-col">
+                <div className="flex-1 h-full rounded-3xl overflow-hidden shadow-2xl border border-gray-200 bg-white flex flex-col">
+                    <ChatPanel 
+                        state={state ? { ...state, mode: viewMode } : null} 
+                        onReset={handleReset}
+                        onToggleMode={handleToggleMode}
+                        onPredict={handlePredict}
+                        isPredicting={isPredicting}
+                    />
+                </div>
             </div>
         </div>
     );

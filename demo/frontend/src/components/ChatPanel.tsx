@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import type { State } from '../types';
-import { RefreshCw, Map as MapIcon, Grid, Bot, Play, Send } from 'lucide-react';
+import { RefreshCw, Map as MapIcon, Grid, Bot, Play, Send, ChevronRight, ChevronDown } from 'lucide-react';
 
 interface ChatPanelProps {
     state: State | null;
@@ -10,12 +10,54 @@ interface ChatPanelProps {
     isPredicting: boolean;
 }
 
+// interface ContextBlockProps {
+//     content: string;
+// }
+
+// const ContextBlock: React.FC<ContextBlockProps> = ({ content }) => {
+//     // Basic parsing to split sections
+//     // Assuming format like:
+//     // ### Task Description
+//     // ...
+//     // ### Current Status
+//     // ...
+//     // ### Candidate Nodes
+//     // ...
+    
+//     // We can split by "###" and reconstruct
+//     const sections = content.split("###").filter(s => s.trim());
+    
+//     if (sections.length === 0) return <div className="whitespace-pre-wrap">{content}</div>;
+
+//     return (
+//         <div className="space-y-3">
+//             {sections.map((sec, idx) => {
+//                 const lines = sec.trim().split('\n');
+//                 const title = lines[0].trim();
+//                 const body = lines.slice(1).join('\n').trim();
+                
+//                 return (
+//                     <div key={idx} className="bg-white/50 rounded-lg p-2 border border-amber-200/50">
+//                         <div className="text-[10px] font-bold text-amber-700 uppercase mb-1 border-b border-amber-100 pb-1">
+//                             {title}
+//                         </div>
+//                         <div className="whitespace-pre-wrap text-[10px] text-gray-600 leading-relaxed">
+//                             {body}
+//                         </div>
+//                     </div>
+//                 );
+//             })}
+//         </div>
+//     );
+// };
+
 const MODELS = ["STS (Ours)", "Gemini 1.5 Pro", "GPT-4o", "GLM-4v", "Manual Input"];
 
 const ChatPanel: React.FC<ChatPanelProps> = ({ state, onReset, onToggleMode, onPredict, isPredicting }) => {
     const logsEndRef = useRef<HTMLDivElement>(null);
     const [selectedModel, setSelectedModel] = useState(MODELS[0]);
     const [manualInput, setManualInput] = useState("");
+    const [showPrompt, setShowPrompt] = useState(false);
 
     // Auto-scroll logs
     useEffect(() => {
@@ -53,12 +95,24 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ state, onReset, onToggleMode, onP
         setManualInput("");
     };
 
+    // Helper to format time
+    const formatTime = (seconds: number) => {
+        const startHour = 15;
+        const totalSeconds = Math.floor(seconds) + startHour * 3600;
+        
+        const h = Math.floor(totalSeconds / 3600) % 24;
+        const m = Math.floor((totalSeconds % 3600) / 60);
+        const s = totalSeconds % 60;
+        
+        return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    };
+
     if (!state) return <div className="p-4 flex items-center justify-center h-full text-gray-500">Loading...</div>;
 
     return (
-        <div className="flex flex-col h-full bg-white border-l border-gray-200 shadow-2xl z-20">
+        <div className="flex flex-col h-full bg-white z-20">
             {/* Header */}
-            <div className="px-6 py-4 border-b border-gray-100 bg-gradient-to-r from-white to-gray-50">
+            <div className="px-6 py-5 border-b border-gray-100 bg-gradient-to-r from-white to-gray-50/50 backdrop-blur-sm sticky top-0 z-30">
                 <div className="flex items-center justify-between mb-3">
                     <h2 className="text-lg font-bold text-gray-800 flex items-center">
                         <div className="p-1.5 bg-indigo-100 rounded-lg mr-2.5 text-indigo-600">
@@ -73,43 +127,75 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ state, onReset, onToggleMode, onP
                 
                 <div className="grid grid-cols-2 gap-3">
                     <div className="bg-gray-100 rounded-lg p-2.5 flex flex-col items-center justify-center">
-                        <span className="text-xs text-gray-500 uppercase tracking-wide font-semibold mb-0.5">Current Cost</span>
-                        <span className="text-lg font-mono font-bold text-gray-800">{state.current_cost.toFixed(2)}</span>
+                        <span className="text-xs text-gray-500 uppercase tracking-wide font-semibold mb-0.5">Total Cost</span>
+                        <span className="text-lg font-mono font-bold text-gray-800 tracking-tight">{state.current_cost.toFixed(2)}</span>
                     </div>
-                    <div className="bg-gray-100 rounded-lg p-2.5 flex flex-col items-center justify-center">
-                        <span className="text-xs text-gray-500 uppercase tracking-wide font-semibold mb-0.5">Capacity</span>
+                    <div className="bg-gray-50 rounded-2xl p-3 flex flex-col items-center justify-center border border-gray-100">
+                        <span className="text-[10px] text-gray-400 uppercase tracking-widest font-bold mb-1">Current Time</span>
                         <div className="flex items-end">
-                            <span className={`text-lg font-mono font-bold ${state.remaining_capacity < 5 ? 'text-red-600' : 'text-gray-800'}`}>
-                                {state.remaining_capacity}
+                            <span className="text-lg font-mono font-bold tracking-tight text-gray-800">
+                                {formatTime(state.current_cost)}
                             </span>
-                            <span className="text-xs text-gray-400 mb-1 ml-1">/ {state.capacity}</span>
                         </div>
                     </div>
                 </div>
             </div>
 
+            {/* Environment Prompt (Collapsible) */}
+            {state.text_prompt && (
+                <div className="px-6 py-2 bg-gray-50/50 border-b border-gray-100 transition-all">
+                    <button 
+                        onClick={() => setShowPrompt(!showPrompt)}
+                        className="w-full flex items-center justify-between text-[10px] font-bold text-gray-400 uppercase tracking-widest hover:text-indigo-600 transition-colors py-1"
+                    >
+                        <span className="flex items-center">
+                            {showPrompt ? <ChevronDown size={14} className="mr-1" /> : <ChevronRight size={14} className="mr-1" />}
+                            Current Environment Prompt (Context)
+                        </span>
+                        <span className="text-[9px] bg-gray-100 px-1.5 py-0.5 rounded text-gray-500">
+                            {state.text_prompt.length} chars
+                        </span>
+                    </button>
+                    
+                    {showPrompt && (
+                        <div className="mt-2 p-3 bg-white border border-gray-200 rounded-xl text-[10px] font-mono text-gray-600 whitespace-pre-wrap max-h-48 overflow-y-auto shadow-inner animate-in fade-in slide-in-from-top-1 duration-200">
+                            {state.text_prompt}
+                        </div>
+                    )}
+                </div>
+            )}
+
             {/* Chat/Logs Area */}
-            <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-gray-50/50 scroll-smooth">
+            <div className="flex-1 overflow-y-auto p-5 space-y-5 bg-white scroll-smooth">
                 {state.logs.length === 0 && (
-                    <div className="h-full flex flex-col items-center justify-center text-gray-400 space-y-2 opacity-60">
-                        <Bot size={48} />
-                        <span className="text-sm">No activity yet. Start by selecting a node.</span>
+                    <div className="h-full flex flex-col items-center justify-center text-gray-300 space-y-4">
+                        <div className="p-4 bg-gray-50 rounded-full">
+                            <Bot size={32} />
+                        </div>
+                        <span className="text-sm font-medium">Ready to start mission</span>
                     </div>
                 )}
                 {state.logs.map((log, idx) => {
+                    // Skip context logs
+                    if (log.startsWith("[Context Update]")) return null;
+                    
                     const isModel = log.startsWith("Model");
-                    // const isUser = log.startsWith("User");
+                    
                     return (
-                        <div key={idx} className={`flex ${isModel ? 'justify-start' : 'justify-end'}`}>
-                            <div className={`max-w-[85%] rounded-2xl p-3.5 text-sm shadow-sm ${
+                        <div key={idx} className={`flex ${isModel ? 'justify-start' : 'justify-end'} animate-in fade-in slide-in-from-bottom-2 duration-300`}>
+                            <div className={`rounded-2xl p-4 text-sm leading-relaxed shadow-sm ${
                                 isModel 
-                                    ? 'bg-white border border-gray-100 text-gray-700 rounded-tl-none' 
-                                    : 'bg-indigo-600 text-white rounded-tr-none'
+                                    ? 'bg-gray-50 text-gray-700 rounded-tl-sm border border-gray-100 max-w-[85%]' 
+                                    : 'bg-indigo-600 text-white rounded-tr-sm shadow-indigo-100 max-w-[85%]'
                             }`}>
-                                <div className={`font-semibold text-xs mb-1 opacity-75 ${isModel ? 'text-indigo-600' : 'text-indigo-100'}`}>
-                                    {isModel ? "🤖 Model Agent" : "👤 User"}
+                                <div className={`font-bold text-[10px] uppercase tracking-wider mb-1.5 ${
+                                    isModel 
+                                        ? 'text-indigo-500' 
+                                        : 'text-indigo-200'
+                                }`}>
+                                    {isModel ? "STS-VRP Agent" : "Operator"}
                                 </div>
-                                <div className="leading-relaxed whitespace-pre-wrap">{log}</div>
+                                <div className="whitespace-pre-wrap font-medium">{log}</div>
                             </div>
                         </div>
                     );
@@ -131,17 +217,17 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ state, onReset, onToggleMode, onP
                 
                 {/* Model Selector & Input */}
                 <div className="space-y-3">
-                    <label className="text-xs font-semibold text-gray-500 uppercase tracking-wider ml-1">Control Interface</label>
+                    <label className="text-[10px] font-bold text-gray-400 uppercase tracking-widest ml-1">Control Interface</label>
                     <div className="flex space-x-2">
-                        <div className="relative flex-1">
+                        <div className="relative flex-1 group">
                             <select 
                                 value={selectedModel}
                                 onChange={(e) => setSelectedModel(e.target.value)}
-                                className="w-full appearance-none bg-gray-50 border border-gray-200 text-gray-700 py-2.5 px-4 pr-8 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition text-sm font-medium"
+                                className="w-full appearance-none bg-gray-50 border border-gray-200 text-gray-700 py-3 px-4 pr-8 rounded-2xl focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 transition text-sm font-medium hover:border-gray-300"
                             >
                                 {MODELS.map(m => <option key={m} value={m}>{m}</option>)}
                             </select>
-                            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-3 text-gray-500">
+                            <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-gray-400">
                                 <svg className="fill-current h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M9.293 12.95l.707.707L15.657 8l-1.414-1.414L10 10.828 5.757 6.586 4.343 8z"/></svg>
                             </div>
                         </div>
@@ -150,12 +236,12 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ state, onReset, onToggleMode, onP
                             <button
                                 onClick={() => onPredict(selectedModel)}
                                 disabled={isPredicting || state.remaining_capacity <= 0}
-                                className="flex-shrink-0 bg-indigo-600 hover:bg-indigo-700 text-white p-2.5 rounded-xl transition shadow-md shadow-indigo-200 disabled:bg-gray-300 disabled:shadow-none disabled:cursor-not-allowed flex items-center justify-center min-w-[3rem]"
+                                className="flex-shrink-0 bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white p-3 rounded-2xl transition-all shadow-lg shadow-indigo-200 disabled:bg-gray-200 disabled:shadow-none disabled:cursor-not-allowed flex items-center justify-center min-w-[3.5rem]"
                             >
                                 {isPredicting ? (
                                     <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
                                 ) : (
-                                    <Play size={20} fill="currentColor" />
+                                    <Play size={20} fill="currentColor" className="ml-0.5" />
                                 )}
                             </button>
                         )}
@@ -168,15 +254,29 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ state, onReset, onToggleMode, onP
                                 value={manualInput}
                                 onChange={(e) => setManualInput(e.target.value)}
                                 placeholder="Type action (e.g., 'Go to Node 5')"
-                                className="flex-1 bg-white border border-gray-300 text-gray-900 text-sm rounded-xl focus:ring-indigo-500 focus:border-indigo-500 block p-2.5 outline-none shadow-sm"
+                                className="flex-1 bg-gray-50 border border-gray-200 text-gray-900 text-sm rounded-2xl focus:ring-indigo-500 focus:border-indigo-500 block p-3 outline-none transition-all hover:border-gray-300"
                                 autoFocus
+                                list="node-options"
                             />
+                            <datalist id="node-options">
+                                {state.nodes.map(n => {
+                                    if (state.current_path.includes(n.id) || n.type === 'depot') return null;
+                                    const start = n.time_window ? formatTime(n.time_window[0]) : "";
+                                    const end = n.time_window ? formatTime(n.time_window[1]) : "";
+                                    const tw = n.time_window ? `[${start} - ${end}]` : "";
+                                    return (
+                                        <option key={n.id} value={`Go to Node ${n.id}`}>
+                                            {tw} Demand: {n.demand}
+                                        </option>
+                                    );
+                                })}
+                            </datalist>
                             <button
                                 type="submit"
                                 disabled={!manualInput.trim()}
-                                className="bg-indigo-600 hover:bg-indigo-700 text-white p-2.5 rounded-xl transition shadow-md shadow-indigo-200 disabled:bg-gray-300 disabled:shadow-none disabled:cursor-not-allowed flex items-center justify-center min-w-[3rem]"
+                                className="bg-indigo-600 hover:bg-indigo-700 active:scale-95 text-white p-3 rounded-2xl transition-all shadow-lg shadow-indigo-200 disabled:bg-gray-200 disabled:shadow-none disabled:cursor-not-allowed flex items-center justify-center min-w-[3.5rem]"
                             >
-                                <Send size={18} />
+                                <Send size={18} className="ml-0.5" />
                             </button>
                         </form>
                     )}
@@ -185,23 +285,23 @@ const ChatPanel: React.FC<ChatPanelProps> = ({ state, onReset, onToggleMode, onP
                 <div className="grid grid-cols-2 gap-3 pt-2">
                     <button
                         onClick={onReset}
-                        className="flex items-center justify-center px-4 py-2.5 bg-red-50 text-red-600 border border-red-100 rounded-xl hover:bg-red-100 hover:border-red-200 transition text-sm font-medium group"
+                        className="flex items-center justify-center px-4 py-3 bg-rose-50 text-rose-600 border border-rose-100 rounded-2xl hover:bg-rose-100 hover:border-rose-200 transition-all text-sm font-semibold group"
                     >
                         <RefreshCw size={16} className="mr-2 group-hover:rotate-180 transition-transform duration-500" />
-                        Reset Env
+                        Reset
                     </button>
                     
                     <button
                         onClick={onToggleMode}
-                        className="flex items-center justify-center px-4 py-2.5 bg-gray-50 text-gray-700 border border-gray-200 rounded-xl hover:bg-gray-100 hover:border-gray-300 transition text-sm font-medium"
+                        className="flex items-center justify-center px-4 py-3 bg-gray-50 text-gray-600 border border-gray-200 rounded-2xl hover:bg-gray-100 hover:border-gray-300 transition-all text-sm font-semibold"
                     >
                         {state.mode === 'real' ? (
                             <>
-                                <Grid size={16} className="mr-2 text-gray-500" /> Virtual View
+                                <Grid size={16} className="mr-2 text-gray-400" /> Virtual View
                             </>
                         ) : (
                             <>
-                                <MapIcon size={16} className="mr-2 text-gray-500" /> Real Map
+                                <MapIcon size={16} className="mr-2 text-gray-400" /> Real Map
                             </>
                         )}
                     </button>

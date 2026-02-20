@@ -43,6 +43,19 @@ const MapPanel: React.FC<MapPanelProps> = ({ state, mode, onNodeClick }) => {
         setImgTimestamp(Date.now());
     }, [state?.current_path, state?.nodes]);
 
+    // Helper to format time (assuming cost is in seconds and start time is 15:00:00)
+    // Export this or pass it down if needed elsewhere, but for now we duplicate or keep it local
+    const formatTime = (seconds: number) => {
+        const startHour = 15;
+        const totalSeconds = Math.floor(seconds) + startHour * 3600;
+        
+        const h = Math.floor(totalSeconds / 3600) % 24;
+        const m = Math.floor((totalSeconds % 3600) / 60);
+        const s = totalSeconds % 60;
+        
+        return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    };
+
     if (!state) return <div className="flex items-center justify-center h-full bg-gray-100">Loading State...</div>;
 
     const { nodes, current_path } = state;
@@ -57,13 +70,14 @@ const MapPanel: React.FC<MapPanelProps> = ({ state, mode, onNodeClick }) => {
         return (
             <div className="h-full w-full relative">
                 <MapContainer 
-                    center={[37.7749, -122.4194]} 
-                    zoom={13} 
+                    center={[52.5200, 13.4050]} // Berlin Center
+                    zoom={11} 
                     style={{ height: '100%', width: '100%' }}
                 >
                     <TileLayer
-                        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                        url="https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}"
+                        subdomains={['1', '2', '3', '4']}
+                        attribution='&copy; <a href="https://www.amap.com/">高德地图</a>'
                     />
                     <MapUpdater nodes={nodes} />
                     
@@ -98,6 +112,11 @@ const MapPanel: React.FC<MapPanelProps> = ({ state, mode, onNodeClick }) => {
                                     <div className="text-xs">
                                         Demand: {node.demand}
                                     </div>
+                                    {node.time_window && (
+                                        <div className="text-xs text-indigo-600 font-medium">
+                                            TW: {formatTime(node.time_window[0])} - {formatTime(node.time_window[1])}
+                                        </div>
+                                    )}
                                 </Tooltip>
                             </CircleMarker>
                         );

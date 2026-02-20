@@ -3,11 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import random
-import numpy as np
-import math
-import cv2
 import base64
+import sys
+import os
+
+# Ensure adapter can be imported
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from adapter import RL4COEnvAdapter
 
 app = FastAPI()
 
@@ -29,6 +31,7 @@ class Node(BaseModel):
     x: float  # Normalized x (0-1) or grid (0-224)
     y: float  # Normalized y (0-1) or grid (0-224)
     demand: Optional[float] = 0.0
+    time_window: Optional[List[float]] = None
 
 class State(BaseModel):
     nodes: List[Node]
@@ -38,6 +41,7 @@ class State(BaseModel):
     remaining_capacity: float
     mode: str = "real"  # "real" or "virtual"
     logs: List[str] = []
+    text_prompt: str = ""
 
 class Action(BaseModel):
     node_id: int
@@ -51,196 +55,197 @@ class ModelResponse(BaseModel):
     decision: str
     node_id: int
 
-# --- Global State (In-memory for demo simplicity) ---
-# In a real app, use a database or session management
-global_state: Dict[str, Any] = {
-    "nodes": [],
-    "current_path": [],
-    "current_cost": 0.0,
-    "capacity": 100.0,
-    "remaining_capacity": 100.0,
-    "logs": []
-}
+# --- Global State ---
+# We store the adapter instance and the latest response
+adapter = RL4COEnvAdapter()
+latest_response: Dict[str, Any] = {}
+global_logs: List[str] = []
 
-# --- Helper Functions ---
-def calculate_distance(node1: Dict, node2: Dict) -> float:
-    return math.sqrt((node1["x"] - node2["x"])**2 + (node1["y"] - node2["y"])**2)
-
-def generate_random_nodes(num_customers: int = 10) -> List[Node]:
-    nodes = []
-    # Center around San Francisco for Real Map
-    center_lat = 37.7749
-    center_lon = -122.4194
-    
-    # Depot
-    nodes.append(Node(
-        id=0,
-        type="depot",
-        lat=center_lat,
-        lon=center_lon,
-        x=112, # Center of 224x224 grid
-        y=112,
-        demand=0
-    ))
-    
-    for i in range(1, num_customers + 1):
-        # Random offset for lat/lon
-        lat_offset = (random.random() - 0.5) * 0.1
-        lon_offset = (random.random() - 0.5) * 0.1
-        
-        # Map to 224x224 grid roughly
-        # This is a simple linear mapping for demo purposes
-        x = 112 + (lon_offset * 2000) # Scale factor
-        y = 112 + (lat_offset * 2000)
-        
-        # Clamp to 0-224
-        x = max(0, min(224, x))
-        y = max(0, min(224, y))
-        
-        nodes.append(Node(
-            id=i,
-            type="customer",
-            lat=center_lat + lat_offset,
-            lon=center_lon + lon_offset,
-            x=x,
-            y=y,
-            demand=random.randint(1, 10)
-        ))
-    return nodes
-
-def draw_virtual_map(nodes: List[Dict], current_path: List[int]) -> np.ndarray:
-    # Create white canvas 224x224
-    img = np.ones((224, 224, 3), dtype=np.uint8) * 255
-    
-    # Draw Grid (optional, faint gray)
-    step = 28
-    for i in range(0, 224, step):
-        cv2.line(img, (i, 0), (i, 224), (240, 240, 240), 1)
-        cv2.line(img, (0, i), (224, i), (240, 240, 240), 1)
-
-    # Draw Path
-    path_nodes = [n for id in current_path for n in nodes if n["id"] == id]
-    for i in range(len(path_nodes) - 1):
-        pt1 = (int(path_nodes[i]["x"]), int(path_nodes[i]["y"]))
-        pt2 = (int(path_nodes[i+1]["x"]), int(path_nodes[i+1]["y"]))
-        cv2.line(img, pt1, pt2, (255, 0, 0), 2) # Blue path
-
-    # Draw Nodes
-    for node in nodes:
-        pt = (int(node["x"]), int(node["y"]))
-        color = (0, 0, 255) if node["type"] == "depot" else (0, 200, 0) # Red depot, Green customer
-        radius = 5 if node["type"] == "depot" else 3
-        
-        # If visited, gray out
-        if node["id"] in current_path:
-             if node["type"] != "depot" or (node["type"] == "depot" and len(current_path) > 1 and current_path[-1] == 0):
-                color = (150, 150, 150)
-
-        cv2.circle(img, pt, radius, color, -1)
-        # Optional: Demand text
-        # cv2.putText(img, str(node["demand"]), (pt[0]+5, pt[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0,0,0), 1)
-
-    return img
+def format_time(seconds: float) -> str:
+    start_hour = 15
+    total_seconds = int(seconds) + start_hour * 3600
+    h = (total_seconds // 3600) % 24
+    m = (total_seconds % 3600) // 60
+    s = total_seconds % 60
+    return f"{h:02}:{m:02}:{s:02}"
 
 # --- API Endpoints ---
 
 @app.post("/api/reset")
 def reset_environment():
-    global global_state
-    nodes = generate_random_nodes(10)
-    global_state["nodes"] = [node.dict() for node in nodes]
-    global_state["current_path"] = [0] # Start at depot
-    global_state["current_cost"] = 0.0
-    global_state["capacity"] = 20.0
-    global_state["remaining_capacity"] = 20.0
-    global_state["logs"] = ["Environment initialized. Started at Depot (Node 0)."]
-    return global_state
+    global latest_response, global_logs
+    try:
+        latest_response = adapter.reset()
+        global_logs = ["Environment initialized via RL4CO Adapter."]
+        
+        # Append Initial Prompt
+        # prompt_log = f"[Context Update]\n{latest_response.get('text_prompt', '')}"
+        # global_logs.append(prompt_log)
+        
+        # Construct State object
+        raw = latest_response["raw_state"]
+        return {
+            "nodes": raw["nodes"],
+            "current_path": raw["current_path"],
+            "current_cost": raw["current_cost"],
+            "capacity": raw["capacity"],
+            "remaining_capacity": raw["remaining_capacity"],
+            "mode": "real",
+            "logs": global_logs,
+            "text_prompt": latest_response.get("text_prompt", "")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/state")
 def get_state():
-    return global_state
+    global latest_response, global_logs
+    if not latest_response:
+        # If no state, try reset
+        return reset_environment()
+        
+    raw = latest_response["raw_state"]
+    return {
+        "nodes": raw["nodes"],
+        "current_path": raw["current_path"],
+        "current_cost": raw["current_cost"],
+        "capacity": raw["capacity"],
+        "remaining_capacity": raw["remaining_capacity"],
+        "mode": "real",
+        "logs": global_logs,
+        "text_prompt": latest_response.get("text_prompt", "")
+    }
 
 @app.post("/api/step")
 def step(action: Action):
-    global global_state
+    global latest_response, global_logs
     node_id = action.node_id
     
-    nodes = global_state["nodes"]
-    target_node = next((n for n in nodes if n["id"] == node_id), None)
-    
-    if not target_node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    
-    last_node_id = global_state["current_path"][-1]
-    last_node = next((n for n in nodes if n["id"] == last_node_id), None)
-    
-    dist = calculate_distance(target_node, last_node)
-    
-    global_state["current_path"].append(node_id)
-    global_state["current_cost"] += dist
-    global_state["remaining_capacity"] -= target_node["demand"]
-    
-    log_msg = f"User selected Node {node_id}. Cost: +{dist:.2f}, Remaining Cap: {global_state['remaining_capacity']}"
-    global_state["logs"].append(log_msg)
-    
-    return global_state
+    try:
+        # Call Adapter
+        latest_response = adapter.step(node_id)
+        
+        # Log
+        raw = latest_response["raw_state"]
+        nodes = raw["nodes"]
+        
+        # Find node TW
+        target_node = next((n for n in nodes if n["id"] == node_id), None)
+        tw_str = ""
+        if target_node and "time_window" in target_node:
+            tw = target_node["time_window"]
+            tw_str = f" [TW: {format_time(tw[0])} - {format_time(tw[1])}]"
+            
+        current_time_str = format_time(raw['current_cost'])
+        
+        log_msg = f"Moved to Node {node_id}{tw_str}. Time: {current_time_str}"
+        global_logs.append(log_msg)
+        
+        # Append Prompt as a System/Context Log
+        # prompt_log = f"[Context Update]\n{latest_response.get('text_prompt', '')}"
+        # global_logs.append(prompt_log)
+        
+        return {
+            "nodes": raw["nodes"],
+            "current_path": raw["current_path"],
+            "current_cost": raw["current_cost"],
+            "capacity": raw["capacity"],
+            "remaining_capacity": raw["remaining_capacity"],
+            "mode": "real",
+            "logs": global_logs,
+            "text_prompt": latest_response.get("text_prompt", "")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/virtual-map")
 def get_virtual_map():
-    global global_state
-    if not global_state["nodes"]:
+    global latest_response
+    if not latest_response:
         reset_environment()
         
-    img = draw_virtual_map(global_state["nodes"], global_state["current_path"])
-    _, buffer = cv2.imencode('.png', img)
-    return Response(content=buffer.tobytes(), media_type="image/png")
+    b64_str = latest_response.get("virtual_map", "")
+    if not b64_str:
+        # Return empty transparent pixel or placeholder
+        return Response(content=b"", media_type="image/png")
+        
+    # Decode base64
+    try:
+        img_data = base64.b64decode(b64_str)
+        return Response(content=img_data, media_type="image/png")
+    except Exception as e:
+        print(f"Error decoding image: {e}")
+        return Response(content=b"", media_type="image/png")
 
 @app.post("/api/predict")
 def predict(req: ModelRequest):
-    global global_state
+    global latest_response, global_logs
     model = req.model_name
     
-    # Mock Logic for different models
-    # In a real app, this would call the LLM API with the image from get_virtual_map and state text
+    if not latest_response:
+        reset_environment()
     
-    nodes = global_state["nodes"]
-    current_path = global_state["current_path"]
-    visited = set(current_path)
+    # 1. Get Context from Adapter
+    text_prompt = latest_response.get("text_prompt", "")
+    # Note: We also have the image in latest_response["virtual_map"]
     
-    # Simple Greedy Strategy for "Mock" Model
-    unvisited = [n for n in nodes if n["id"] not in visited]
+    # 2. Mock Model Logic (Greedy based on text prompt parsing or raw state)
+    # For now, we still use a simple heuristic on raw state, 
+    # but in future this is where we call the LLM API with `text_prompt` + image.
+    
+    raw = latest_response["raw_state"]
+    current_path = raw["current_path"]
+    nodes = raw["nodes"]
+    
+    # Find unvisited nodes
+    visited_ids = set(current_path)
+    unvisited = [n for n in nodes if n["id"] not in visited_ids]
     
     decision_node = -1
-    thought = ""
+    thought = "Thinking..."
     
     if not unvisited:
-        # Return to depot if all visited
         if current_path[-1] != 0:
             decision_node = 0
             thought = "All customers visited. Returning to depot."
         else:
-             thought = "All done."
+            thought = "Mission Complete."
     else:
-        # Find closest unvisited
-        last_node = next(n for n in nodes if n["id"] == current_path[-1])
-        closest = min(unvisited, key=lambda n: calculate_distance(n, last_node))
+        # Greedy heuristic: closest unvisited
+        # We can calculate distance using lat/lon or x/y
+        last_node_id = current_path[-1]
+        last_node = next(n for n in nodes if n["id"] == last_node_id)
+        
+        def dist(n1, n2):
+            return math.sqrt((n1["x"] - n2["x"])**2 + (n1["y"] - n2["y"])**2)
+            
+        closest = min(unvisited, key=lambda n: dist(n, last_node))
         decision_node = closest["id"]
-        thought = f"Calculated distances to remaining {len(unvisited)} nodes. Node {closest['id']} is closest at distance {calculate_distance(closest, last_node):.2f}."
+        thought = f"Based on spatial analysis, Node {decision_node} is the optimal next stop to minimize travel time."
 
-    # Simulate Model Output
-    observation = f"I see {len(nodes)} nodes. Current position is Node {current_path[-1]}. {len(unvisited)} unvisited customers remaining."
+    # Log the model's decision
+    target_node = next((n for n in nodes if n["id"] == decision_node), None)
+    tw_str = ""
+    if target_node and "time_window" in target_node:
+        tw = target_node["time_window"]
+        tw_str = f" [TW: {format_time(tw[0])} - {format_time(tw[1])}]"
     
-    # Format for Chat
-    log_msg = f"Model ({model}) chose Node {decision_node}."
-    global_state["logs"].append(log_msg)
+    log_msg = f"Model ({model}) selected Node {decision_node}{tw_str}."
+    global_logs.append(log_msg)
+    
+    # We don't append context here because predict doesn't change state/context, only step does.
+    # However, if we wanted to show what the model saw, we could. 
+    # But user asked for "environment prompt" which usually updates on step.
+    # Step updates the state, so the prompt changes. Predict uses current state.
     
     return {
-        "observation": observation,
+        "observation": text_prompt, # Send the actual text prompt the model "saw"
         "thought": thought,
-        "decision": f"\\boxed{{Option A [Node {decision_node}]}}", # Simulate LaTeX output
+        "decision": f"Action: {decision_node}",
         "node_id": decision_node
     }
 
 if __name__ == "__main__":
     import uvicorn
+    import math
     uvicorn.run(app, host="0.0.0.0", port=8000)

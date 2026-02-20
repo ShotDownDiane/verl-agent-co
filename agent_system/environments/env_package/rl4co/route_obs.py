@@ -2078,52 +2078,59 @@ def build_obs_tdtsp(
     return obs_list
 
 # --- 1. 物理斥力分散算法 (通用 Helper) ---
-def disperse_locations_global(locs, repulsion_radius=0.035, iterations=50):
+def disperse_locations_global(locs, min_dist=0.025, iterations=15, anchor_strength=0.6):
     """
-    对所有点进行物理斥力扩散，解决视觉重叠问题。
-    
+    带锚定的斥力扩散，在减少视觉重叠的同时保持空间结构。
+
+    核心思想：每个点受到两种力的作用：
+    1. 斥力：推开距离过近的邻居节点
+    2. 锚定力：将节点拉回原始位置，防止大幅偏移
+
+    通过平衡这两种力，可以在减少重叠的同时保持凸包、相对排序等空间结构。
+
     Args:
-        locs: 原始坐标 [N, 2]
-        repulsion_radius: 斥力半径 (0-1空间下，0.035 约等于 3.5% 的地图跨度)
-        iterations: 迭代次数
+        locs: 原始坐标 [N, 2]，值域 [0, 1]
+        min_dist: 最小距离阈值，低于此距离的点对会被推开
+        iterations: 迭代次数（较少以减少累积偏移）
+        anchor_strength: 锚定力系数 (0-1)，越大越保持原始位置
     Returns:
-        new_locs: 分散后的坐标，保持拓扑结构但互不遮挡
+        new_locs: 分散后的坐标，保持空间结构且减少重叠
     """
+    original = locs.copy().astype(np.float32)
     new_locs = locs.copy().astype(np.float32)
     num_points = len(new_locs)
-    
-    if num_points < 2: return new_locs
-    
-    # 动态调整半径：如果点太多，适当减小半径防止炸开
+
+    if num_points < 2:
+        return new_locs
+
+    # 动态调整：节点过多时减小最小距离，防止过度扩散
     if num_points > 50:
-        repulsion_radius *= 0.8
-    
+        min_dist *= 0.7
+
     for _ in range(iterations):
-        # 计算所有点对之间的距离矩阵
-        # diff[i, j] = pos[i] - pos[j]
-        diff = new_locs[:, None, :] - new_locs[None, :, :] # [N, N, 2]
-        dist = np.linalg.norm(diff, axis=-1) # [N, N]
-        
-        # 避免自身排斥和除零
+        diff = new_locs[:, None, :] - new_locs[None, :, :]  # [N, N, 2]
+        dist = np.linalg.norm(diff, axis=-1)                # [N, N]
         np.fill_diagonal(dist, np.inf)
-        
-        # 找到冲突点 (距离 < 半径)
-        mask = dist < repulsion_radius
-        if not np.any(mask): break # 如果没有冲突，提前结束
-            
-        # 计算斥力大小：距离越近斥力越大 (线性衰减)
-        force_mag = (repulsion_radius - dist) * 0.5
+
+        mask = dist < min_dist
+        if not np.any(mask):
+            break
+
+        # 斥力：距离越近力越大（线性衰减），但整体更温和
+        force_mag = (min_dist - dist) * 0.3
         force_mag[~mask] = 0
-        
-        # 计算方向向量
+
         direction = diff / (dist[..., None] + 1e-9)
-        
-        # 合力 = Sum(方向 * 大小)
-        total_force = np.sum(direction * force_mag[..., None], axis=1)
-        
-        # 更新位置 (阻尼系数 0.5 保证稳定)
-        new_locs += total_force * 0.5
-        
+        repulsion = np.sum(direction * force_mag[..., None], axis=1)
+
+        # 锚定力：拉回原始位置
+        anchor = (original - new_locs) * anchor_strength
+
+        # 组合更新：小步长避免震荡
+        new_locs += repulsion * 0.3 + anchor * 0.15
+
+    # 钳制到安全范围
+    new_locs = np.clip(new_locs, 0.02, 0.98)
     return new_locs
 
 def render_tdtsp_smart_dual_view(
@@ -2420,6 +2427,11 @@ def build_obs_tdtsp_tw(
         curr_idx = int(current_node[i])
         curr_pos = curr_locs[curr_idx]
         time_val = float(current_time[i]) if hasattr(current_time[i], 'item') else float(current_time[i])
+
+        # 2.1.1 Visual coordinates: apply structure-preserving dispersion once
+        # Used for BOTH text coordinates and image rendering to ensure consistency
+        curr_locs_vis = disperse_locations_global(curr_locs.copy())
+        curr_pos_vis = curr_locs_vis[curr_idx]
         
         # Matrix Lookup
         if hasattr(duration, 'dim') and duration.dim() > 0:
@@ -2511,11 +2523,12 @@ def build_obs_tdtsp_tw(
         for j, idx_val in enumerate(target_indices):
             uid = int(idx_val)
             cand_pos = curr_locs[uid]
-            
-            # (i) Coordinates: Map to [0, 224]
-            int_x = int(cand_pos[0] * 224)
-            int_y = int(cand_pos[1] * 224)
-            
+
+            # (i) Coordinates: Map to [0, 448] using visual (dispersed) coords
+            cand_pos_vis = curr_locs_vis[uid]
+            int_x = int(cand_pos_vis[0] * 448)
+            int_y = int(cand_pos_vis[1] * 448)
+
             # (ii) Cost Metrics
             dist_val = np.linalg.norm(cand_pos - curr_pos)
             
@@ -2616,7 +2629,7 @@ def build_obs_tdtsp_tw(
         status_section = (
             "\\noindent\\emph{2. System Status.}\n"
             "Following the instruction, the system status block summarizes the agent's current state.\n"
-            f"Simulation Time: {time_val:.2f} | Agent Coordinates: ({int(curr_pos[0]*224)}, {int(curr_pos[1]*224)})\n"
+            f"Simulation Time: {time_val:.2f} | Agent Coordinates: ({int(curr_pos_vis[0]*448)}, {int(curr_pos_vis[1]*448)})\n"
             f"Movement Trend: {trend_str} ({routing_stage})\n"
             f"Unvisited Nodes: {len(unvisited_indices)}"
         )
@@ -2660,7 +2673,7 @@ def build_obs_tdtsp_tw(
             image_save_path = f"{image_save_dir}env{i}_step{len(path_history):03d}_{uid}.png"
         
         img_b64, image_rgb_np = render_tdtsptw_smart_dual_view(
-            locs=curr_locs,
+            locs=curr_locs_vis,
             visited_mask=(visited[i]==1),
             current_node_idx=curr_idx,
             path_history=path_history,
@@ -2695,127 +2708,146 @@ def build_obs_tdtsp_tw(
 
 
 def render_tdtsptw_smart_dual_view(
-    locs, visited_mask, current_node_idx, path_history, top_candidates, 
-    current_time, time_windows, img_height=224, debug_save_path=None
+    locs, visited_mask, current_node_idx, path_history, top_candidates,
+    current_time, time_windows, img_height=448, debug_save_path=None
 ):
     """
-    Render a single 224x224 global map for the multimodal prompt.
+    Render a global map for the multimodal prompt (light theme, 448x448).
     Layers:
-    1. Global Geometry (Depot, Visited, Unvisited, Current)
-    2. Trajectory (History)
-    3. Candidates (Labeled A, B, C...)
+    0. Background with subtle grid
+    1. Trajectory (History path with direction arrows)
+    2. Global Geometry (Depot, Visited, Unvisited)
+    3. Current Node (highlighted)
+    4. Candidates (Labeled A, B, C... with colored markers)
     """
-    # Force 224x224 as requested
-    img_size = 224
-    canvas = np.ones((img_size, img_size, 3), dtype=np.uint8) * 255
-    
-    # --- 1. Coordinate Transform ---
-    # Disperse to minimize overlap
-    locs = disperse_locations_global(locs)
-    
-    # Map to [0, 224] and Flip Y (to align with Cartesian North=Up)
-    # x_pix = x * W
-    # y_pix = H - y * H
-    pts = np.zeros_like(locs, dtype=np.int32)
-    pts[:, 0] = (locs[:, 0] * img_size).astype(np.int32)
-    pts[:, 1] = img_size - (locs[:, 1] * img_size).astype(np.int32)
-    
-    # Clamp to be safe
-    pts = np.clip(pts, 0, img_size - 1)
+    img_size = img_height
+    padding = max(20, img_size // 20)  # ~5% padding on each side
+    draw_area = img_size - 2 * padding
 
-    # --- Colors (BGR) ---
-    COLOR_DEPOT = (0, 0, 0)        # Black Square
-    COLOR_VISITED = (200, 200, 200) # Light Grey
-    COLOR_UNVISITED = (180, 180, 180) # Grey (Default) - Wait, description says "different colors"
-    # Let's use:
-    # Depot: Black/Distinct
-    # Visited: Light Grey
-    # Unvisited: Blueish/Reddish? 
-    # Current: Blue
-    
-    COLOR_UNVISITED_NODE = (100, 100, 100) # Darker Grey for normal nodes
-    COLOR_CURRENT = (255, 0, 0) # Blue (BGR)
-    COLOR_CANDIDATE = (0, 0, 255) # Red for Candidates?
-    
-    # --- Layer 2: Trajectory ---
+    # --- Layer 0: Background & Grid ---
+    canvas = np.ones((img_size, img_size, 3), dtype=np.uint8) * 250  # off-white
+
+    grid_color = (232, 232, 232)
+    num_grid = 8
+    for gi in range(num_grid + 1):
+        pos = padding + int(gi * draw_area / num_grid)
+        cv2.line(canvas, (padding, pos), (img_size - padding, pos), grid_color, 1)
+        cv2.line(canvas, (pos, padding), (pos, img_size - padding), grid_color, 1)
+    cv2.rectangle(canvas, (padding, padding),
+                  (img_size - padding - 1, img_size - padding - 1), (200, 200, 200), 1)
+
+    # --- 1. Coordinate Transform (dispersion already applied by caller) ---
+    pts = np.zeros_like(locs, dtype=np.int32)
+    pts[:, 0] = (padding + locs[:, 0] * draw_area).astype(np.int32)
+    pts[:, 1] = (img_size - padding - locs[:, 1] * draw_area).astype(np.int32)
+    pts = np.clip(pts, padding, img_size - padding - 1)
+
+    # --- Colors (BGR for OpenCV) ---
+    COLOR_DEPOT       = (30, 30, 170)       # Dark red
+    COLOR_VISITED     = (215, 195, 175)     # Light warm gray
+    COLOR_UNVISITED   = (150, 150, 150)     # Medium gray
+    COLOR_CURRENT     = (220, 110, 20)      # Bright blue
+    COLOR_CANDIDATE   = (40, 70, 220)       # Red-orange
+    COLOR_PATH        = (195, 155, 75)      # Medium blue
+    COLOR_PATH_ARROW  = (170, 130, 50)      # Slightly darker blue
+
+    # Adaptive sizes based on resolution
+    small_r  = max(2, img_size // 160)
+    depot_sz = max(5, img_size // 75)
+    cand_r   = max(4, img_size // 100)
+    cur_outer = max(8, img_size // 55)
+    cur_inner = max(5, img_size // 75)
+    path_thick = max(2, img_size // 180)
+
+    # --- Layer 1: Trajectory ---
     if len(path_history) > 1:
         hist_pts = pts[path_history]
-        # Draw connected path
-        cv2.polylines(canvas, [hist_pts], isClosed=False, color=(200, 200, 200), thickness=2, lineType=cv2.LINE_AA)
-        
-        # Optional: Gradient or Direction arrows? 
-        # Description says "connected path". Keep it simple.
-        
-    # --- Layer 1: Global Geometry (Nodes) ---
-    # Draw all nodes first
+        cv2.polylines(canvas, [hist_pts], isClosed=False,
+                      color=COLOR_PATH, thickness=path_thick, lineType=cv2.LINE_AA)
+        # Direction arrows on every other segment
+        for k in range(0, len(hist_pts) - 1, 2):
+            p1, p2 = hist_pts[k], hist_pts[k + 1]
+            mid_x = (int(p1[0]) + int(p2[0])) // 2
+            mid_y = (int(p1[1]) + int(p2[1])) // 2
+            dx = int(p2[0]) - int(p1[0])
+            dy = int(p2[1]) - int(p1[1])
+            frac = 0.15
+            cv2.arrowedLine(canvas,
+                            (int(mid_x - dx * frac), int(mid_y - dy * frac)),
+                            (int(mid_x + dx * frac), int(mid_y + dy * frac)),
+                            COLOR_PATH_ARROW, max(1, path_thick - 1),
+                            tipLength=0.4, line_type=cv2.LINE_AA)
+
+    # --- Layer 2: Global Geometry (Nodes) ---
+    cand_id_set = {c['id'] for c in top_candidates[:10]}
+
     for i in range(len(locs)):
         pt = tuple(pts[i])
-        radius = 3
-        
-        if i == 0: # Depot
-            cv2.rectangle(canvas, (pt[0]-4, pt[1]-4), (pt[0]+4, pt[1]+4), (0, 0, 0), -1, cv2.LINE_AA)
+        if i == 0:  # Depot
+            cv2.rectangle(canvas,
+                          (pt[0] - depot_sz, pt[1] - depot_sz),
+                          (pt[0] + depot_sz, pt[1] + depot_sz),
+                          COLOR_DEPOT, -1, cv2.LINE_AA)
+            cv2.rectangle(canvas,
+                          (pt[0] - depot_sz, pt[1] - depot_sz),
+                          (pt[0] + depot_sz, pt[1] + depot_sz),
+                          (255, 255, 255), 1, cv2.LINE_AA)
             continue
-            
-        if i == current_node_idx:
-            continue # Draw later
-            
-        # Check if candidate
-        is_candidate = False
-        for c in top_candidates:
-            if c['id'] == i: is_candidate = True; break
-        
-        if is_candidate:
-            continue # Draw later
-            
+        if i == current_node_idx or i in cand_id_set:
+            continue  # Draw later
         if visited_mask[i]:
-            cv2.circle(canvas, pt, radius, COLOR_VISITED, -1, cv2.LINE_AA)
+            cv2.circle(canvas, pt, small_r, COLOR_VISITED, -1, cv2.LINE_AA)
         else:
-            cv2.circle(canvas, pt, radius, COLOR_UNVISITED_NODE, -1, cv2.LINE_AA)
+            cv2.circle(canvas, pt, small_r, COLOR_UNVISITED, -1, cv2.LINE_AA)
 
-    # --- Layer 4: Current Node ---
+    # --- Layer 3: Current Node ---
     curr_pt = tuple(pts[current_node_idx])
-    cv2.circle(canvas, curr_pt, 6, COLOR_CURRENT, -1, cv2.LINE_AA)
-    cv2.circle(canvas, curr_pt, 8, (255, 255, 255), 1, cv2.LINE_AA) # White border
+    cv2.circle(canvas, curr_pt, cur_outer, (255, 255, 255), -1, cv2.LINE_AA)
+    cv2.circle(canvas, curr_pt, cur_inner, COLOR_CURRENT, -1, cv2.LINE_AA)
+    cv2.circle(canvas, curr_pt, cur_outer, COLOR_CURRENT, 2, cv2.LINE_AA)
 
-    # --- Layer 3: Candidates ---
-    # "We annotate all candidate nodes... use the same identifiers"
+    # --- Layer 4: Candidates ---
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.45, img_size / 850.0)
+    font_thick = max(1, img_size // 350)
+
     for rank, cand in enumerate(top_candidates):
+        if rank >= 10:
+            break
         cand_idx = cand['id']
         pt = tuple(pts[cand_idx])
-        label = chr(65 + rank) if rank < 26 else f"Opt{rank}"
-        
-        # Draw Node
-        cv2.circle(canvas, pt, 5, (0, 0, 255), -1, cv2.LINE_AA) # Red dot
-        
-        # Draw Label
-        # White box background for readability
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.5
-        thick = 1
-        (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
-        
-        # Position label slightly offset? Or centered?
-        # If overlap is minimized, centered might be okay, but offset is safer.
-        # Let's put it top-right of the node
-        tx = pt[0] + 6
-        ty = pt[1] - 6
-        
-        # Clamp text position
-        tx = min(tx, img_size - tw - 2)
-        ty = max(ty, th + 2)
-        
-        cv2.rectangle(canvas, (tx-1, ty-th-1), (tx+tw+1, ty+2), (255, 255, 255), -1)
-        cv2.putText(canvas, label, (tx, ty), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+        label = chr(65 + rank) if rank < 26 else f"O{rank}"
+
+        cv2.circle(canvas, pt, cand_r, COLOR_CANDIDATE, -1, cv2.LINE_AA)
+        cv2.circle(canvas, pt, cand_r + 1, (255, 255, 255), 1, cv2.LINE_AA)
+
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
+        tx = pt[0] + cand_r + 4
+        ty = pt[1] - cand_r - 2
+        tx = max(padding, min(tx, img_size - tw - padding))
+        ty = max(th + padding, min(ty, img_size - padding))
+
+        bg_pad = 2
+        cv2.rectangle(canvas,
+                      (tx - bg_pad, ty - th - bg_pad),
+                      (tx + tw + bg_pad, ty + bg_pad + baseline),
+                      (255, 255, 255), -1)
+        cv2.rectangle(canvas,
+                      (tx - bg_pad, ty - th - bg_pad),
+                      (tx + tw + bg_pad, ty + bg_pad + baseline),
+                      COLOR_CANDIDATE, 1)
+        cv2.putText(canvas, label, (tx, ty), font, font_scale,
+                    COLOR_CANDIDATE, font_thick, cv2.LINE_AA)
 
     # --- Output ---
     _, buffer = cv2.imencode('.png', canvas)
     b64_str = base64.b64encode(buffer).decode('utf-8')
     img_rgb_np = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-    
+
     if debug_save_path:
         os.makedirs(os.path.dirname(debug_save_path) if os.path.dirname(debug_save_path) else ".", exist_ok=True)
         cv2.imwrite(debug_save_path, canvas)
-    
+
     return b64_str, img_rgb_np
 
 def build_obs_tdvrp(
@@ -2868,6 +2900,10 @@ def build_obs_tdvrp(
         curr_idx = int(current_node[i])
         curr_pos = curr_locs[curr_idx]
         time_val = float(current_time[i]) if hasattr(current_time[i], 'item') else float(current_time[i])
+
+        # 2.1.1 Visual coordinates: apply structure-preserving dispersion once
+        curr_locs_vis = disperse_locations_global(curr_locs.copy())
+        curr_pos_vis = curr_locs_vis[curr_idx]
         
         # Matrix Lookup Index
         if hasattr(duration, 'dim') and duration.dim() > 0:
@@ -2966,10 +3002,11 @@ def build_obs_tdvrp(
             if uid == curr_idx: continue
             
             cand_pos = curr_locs[uid]
-            
-            # (i) Coordinates: Map to [0, 224]
-            int_x = int(cand_pos[0] * 224)
-            int_y = int(cand_pos[1] * 224)
+
+            # (i) Coordinates: Map to [0, 448] using visual (dispersed) coords
+            cand_pos_vis = curr_locs_vis[uid]
+            int_x = int(cand_pos_vis[0] * 448)
+            int_y = int(cand_pos_vis[1] * 448)
             
             # Physics
             dist_val = np.linalg.norm(cand_pos - curr_pos)
@@ -3141,7 +3178,7 @@ def build_obs_tdvrp(
         status_section = (
             "\\noindent\\emph{2. System Status.}\n"
             "Following the instruction, the system status block summarizes the agent's current state.\n"
-            f"Simulation Time: {time_val:.2f} | Agent Coordinates: ({int(curr_pos[0]*224)}, {int(curr_pos[1]*224)})\n"
+            f"Simulation Time: {time_val:.2f} | Agent Coordinates: ({int(curr_pos_vis[0]*448)}, {int(curr_pos_vis[1]*448)})\n"
             f"Movement Trend: {trend_str} ({routing_stage})\n"
             f"Unvisited Customers: {remaining_nodes} | Costs: Fixed ${FIXED_COST} (New Trip), Labor ${PER_HOUR_COST}/hr"
         )
@@ -3195,7 +3232,7 @@ def build_obs_tdvrp(
             image_save_path = f"{image_save_dir}env{i}_step{len(path_history):03d}_{uid}.png"
             
         img_b64, image_rgb_np = render_tdvrp_smart_dual_view(
-            locs=curr_locs,
+            locs=curr_locs_vis,
             visited_mask=(visited[i]==1),
             current_node_idx=curr_idx,
             path_history=path_history,
@@ -3228,38 +3265,59 @@ def build_obs_tdvrp(
     return obs_list
         
 def render_tdvrp_smart_dual_view(
-    locs, visited_mask, current_node_idx, path_history, top_candidates, 
-    current_time, time_windows, img_height=224, debug_save_path=None
+    locs, visited_mask, current_node_idx, path_history, top_candidates,
+    current_time, time_windows, img_height=448, debug_save_path=None
 ):
     """
-    Render a single 224x224 global map for the multimodal prompt (TDVRP).
+    Render a global map for the multimodal prompt (TDVRP, light theme, 448x448).
     Layers:
-    1. Global Geometry (Depot, Visited, Unvisited, Current)
-    2. Trajectory (History)
-    3. Candidates (Labeled A, B, C...)
+    0. Background with subtle grid
+    1. Trajectory (Multi-route history with direction arrows)
+    2. Global Geometry (Depot, Visited, Unvisited)
+    3. Current Node (highlighted)
+    4. Candidates (Labeled A, B, C... with colored markers)
     """
-    # Force 224x224
-    img_size = 224
-    canvas = np.ones((img_size, img_size, 3), dtype=np.uint8) * 255
-    
-    # --- 1. Coordinate Transform ---
-    locs = disperse_locations_global(locs)
-    
-    # Map to [0, 224] and Flip Y
-    pts = np.zeros_like(locs, dtype=np.int32)
-    pts[:, 0] = (locs[:, 0] * img_size).astype(np.int32)
-    pts[:, 1] = img_size - (locs[:, 1] * img_size).astype(np.int32)
-    pts = np.clip(pts, 0, img_size - 1)
+    img_size = img_height
+    padding = max(20, img_size // 20)
+    draw_area = img_size - 2 * padding
 
-    # --- Colors (BGR) ---
-    COLOR_DEPOT = (0, 0, 0)        # Black Square
-    COLOR_VISITED = (200, 200, 200) # Light Grey
-    COLOR_UNVISITED_NODE = (100, 100, 100) # Darker Grey
-    COLOR_CURRENT = (255, 0, 0) # Blue
-    
-    # --- Layer 2: Trajectory ---
+    # --- Layer 0: Background & Grid ---
+    canvas = np.ones((img_size, img_size, 3), dtype=np.uint8) * 250
+
+    grid_color = (232, 232, 232)
+    num_grid = 8
+    for gi in range(num_grid + 1):
+        pos = padding + int(gi * draw_area / num_grid)
+        cv2.line(canvas, (padding, pos), (img_size - padding, pos), grid_color, 1)
+        cv2.line(canvas, (pos, padding), (pos, img_size - padding), grid_color, 1)
+    cv2.rectangle(canvas, (padding, padding),
+                  (img_size - padding - 1, img_size - padding - 1), (200, 200, 200), 1)
+
+    # --- 1. Coordinate Transform (dispersion already applied by caller) ---
+    pts = np.zeros_like(locs, dtype=np.int32)
+    pts[:, 0] = (padding + locs[:, 0] * draw_area).astype(np.int32)
+    pts[:, 1] = (img_size - padding - locs[:, 1] * draw_area).astype(np.int32)
+    pts = np.clip(pts, padding, img_size - padding - 1)
+
+    # --- Colors (BGR for OpenCV) ---
+    COLOR_DEPOT       = (30, 30, 170)
+    COLOR_VISITED     = (215, 195, 175)
+    COLOR_UNVISITED   = (150, 150, 150)
+    COLOR_CURRENT     = (220, 110, 20)
+    COLOR_CANDIDATE   = (40, 70, 220)
+    COLOR_PATH        = (195, 155, 75)
+    COLOR_PATH_ARROW  = (170, 130, 50)
+
+    # Adaptive sizes
+    small_r  = max(2, img_size // 160)
+    depot_sz = max(5, img_size // 75)
+    cand_r   = max(4, img_size // 100)
+    cur_outer = max(8, img_size // 55)
+    cur_inner = max(5, img_size // 75)
+    path_thick = max(2, img_size // 180)
+
+    # --- Layer 1: Trajectory (Multi-route) ---
     if len(path_history) > 1:
-        # TDVRP Multi-Route handling: Split by Depot (0)
         routes = []
         current_route_seg = []
         for node_idx in path_history:
@@ -3269,81 +3327,116 @@ def render_tdvrp_smart_dual_view(
                 current_route_seg = [0]
         if len(current_route_seg) > 1:
             routes.append(current_route_seg)
-            
+
         for route in routes:
             hist_pts = pts[route]
-            cv2.polylines(canvas, [hist_pts], isClosed=False, color=(180, 180, 180), thickness=2, lineType=cv2.LINE_AA)
+            cv2.polylines(canvas, [hist_pts], isClosed=False,
+                          color=COLOR_PATH, thickness=path_thick, lineType=cv2.LINE_AA)
+            for k in range(0, len(hist_pts) - 1, 2):
+                p1, p2 = hist_pts[k], hist_pts[k + 1]
+                mid_x = (int(p1[0]) + int(p2[0])) // 2
+                mid_y = (int(p1[1]) + int(p2[1])) // 2
+                dx = int(p2[0]) - int(p1[0])
+                dy = int(p2[1]) - int(p1[1])
+                frac = 0.15
+                cv2.arrowedLine(canvas,
+                                (int(mid_x - dx * frac), int(mid_y - dy * frac)),
+                                (int(mid_x + dx * frac), int(mid_y + dy * frac)),
+                                COLOR_PATH_ARROW, max(1, path_thick - 1),
+                                tipLength=0.4, line_type=cv2.LINE_AA)
 
-    # --- Layer 1: Global Geometry (Nodes) ---
+    # --- Layer 2: Global Geometry (Nodes) ---
+    cand_id_set = {c['id'] for c in top_candidates[:10]}
+
     for i in range(len(locs)):
         pt = tuple(pts[i])
-        radius = 3
-        
-        if i == 0: # Depot
-            cv2.rectangle(canvas, (pt[0]-4, pt[1]-4), (pt[0]+4, pt[1]+4), (0, 0, 0), -1, cv2.LINE_AA)
+        if i == 0:  # Depot
+            cv2.rectangle(canvas,
+                          (pt[0] - depot_sz, pt[1] - depot_sz),
+                          (pt[0] + depot_sz, pt[1] + depot_sz),
+                          COLOR_DEPOT, -1, cv2.LINE_AA)
+            cv2.rectangle(canvas,
+                          (pt[0] - depot_sz, pt[1] - depot_sz),
+                          (pt[0] + depot_sz, pt[1] + depot_sz),
+                          (255, 255, 255), 1, cv2.LINE_AA)
             continue
-            
-        if i == current_node_idx:
+        if i == current_node_idx or i in cand_id_set:
             continue
-            
-        # Check if candidate
-        is_candidate = False
-        for c in top_candidates:
-            if c['id'] == i: is_candidate = True; break
-        
-        if is_candidate:
-            continue
-            
         if visited_mask[i]:
-            cv2.circle(canvas, pt, radius, COLOR_VISITED, -1, cv2.LINE_AA)
+            cv2.circle(canvas, pt, small_r, COLOR_VISITED, -1, cv2.LINE_AA)
         else:
-            cv2.circle(canvas, pt, radius, COLOR_UNVISITED_NODE, -1, cv2.LINE_AA)
+            cv2.circle(canvas, pt, small_r, COLOR_UNVISITED, -1, cv2.LINE_AA)
 
-    # --- Layer 4: Current Node ---
+    # --- Layer 3: Current Node ---
     curr_pt = tuple(pts[current_node_idx])
-    # Different shape for Depot if current is Depot
     if current_node_idx == 0:
-        cv2.rectangle(canvas, (curr_pt[0]-5, curr_pt[1]-5), (curr_pt[0]+5, curr_pt[1]+5), COLOR_CURRENT, -1, cv2.LINE_AA)
-        cv2.rectangle(canvas, (curr_pt[0]-5, curr_pt[1]-5), (curr_pt[0]+5, curr_pt[1]+5), (255, 255, 255), 1, cv2.LINE_AA)
+        cur_depot_sz = depot_sz + 2
+        cv2.rectangle(canvas,
+                      (curr_pt[0] - cur_depot_sz, curr_pt[1] - cur_depot_sz),
+                      (curr_pt[0] + cur_depot_sz, curr_pt[1] + cur_depot_sz),
+                      COLOR_CURRENT, -1, cv2.LINE_AA)
+        cv2.rectangle(canvas,
+                      (curr_pt[0] - cur_depot_sz, curr_pt[1] - cur_depot_sz),
+                      (curr_pt[0] + cur_depot_sz, curr_pt[1] + cur_depot_sz),
+                      (255, 255, 255), 2, cv2.LINE_AA)
     else:
-        cv2.circle(canvas, curr_pt, 6, COLOR_CURRENT, -1, cv2.LINE_AA)
-        cv2.circle(canvas, curr_pt, 8, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.circle(canvas, curr_pt, cur_outer, (255, 255, 255), -1, cv2.LINE_AA)
+        cv2.circle(canvas, curr_pt, cur_inner, COLOR_CURRENT, -1, cv2.LINE_AA)
+        cv2.circle(canvas, curr_pt, cur_outer, COLOR_CURRENT, 2, cv2.LINE_AA)
 
-    # --- Layer 3: Candidates ---
+    # --- Layer 4: Candidates ---
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = max(0.45, img_size / 850.0)
+    font_thick = max(1, img_size // 350)
+
     for rank, cand in enumerate(top_candidates):
+        if rank >= 10:
+            break
         cand_idx = cand['id']
         pt = tuple(pts[cand_idx])
-        label = chr(65 + rank) if rank < 26 else f"Opt{rank}"
-        
-        # Draw Node (Special handling for Depot Candidate)
+        label = chr(65 + rank) if rank < 26 else f"O{rank}"
+
         if cand_idx == 0:
-             cv2.rectangle(canvas, (pt[0]-5, pt[1]-5), (pt[0]+5, pt[1]+5), (0, 0, 255), -1, cv2.LINE_AA)
+            cand_depot_sz = depot_sz + 1
+            cv2.rectangle(canvas,
+                          (pt[0] - cand_depot_sz, pt[1] - cand_depot_sz),
+                          (pt[0] + cand_depot_sz, pt[1] + cand_depot_sz),
+                          COLOR_CANDIDATE, -1, cv2.LINE_AA)
+            cv2.rectangle(canvas,
+                          (pt[0] - cand_depot_sz, pt[1] - cand_depot_sz),
+                          (pt[0] + cand_depot_sz, pt[1] + cand_depot_sz),
+                          (255, 255, 255), 1, cv2.LINE_AA)
         else:
-             cv2.circle(canvas, pt, 5, (0, 0, 255), -1, cv2.LINE_AA) # Red dot
-        
-        # Draw Label
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        scale = 0.5
-        thick = 1
-        (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
-        
-        tx = pt[0] + 6
-        ty = pt[1] - 6
-        tx = min(tx, img_size - tw - 2)
-        ty = max(ty, th + 2)
-        
-        cv2.rectangle(canvas, (tx-1, ty-th-1), (tx+tw+1, ty+2), (255, 255, 255), -1)
-        cv2.putText(canvas, label, (tx, ty), font, scale, (0, 0, 0), thick, cv2.LINE_AA)
+            cv2.circle(canvas, pt, cand_r, COLOR_CANDIDATE, -1, cv2.LINE_AA)
+            cv2.circle(canvas, pt, cand_r + 1, (255, 255, 255), 1, cv2.LINE_AA)
+
+        (tw, th), baseline = cv2.getTextSize(label, font, font_scale, font_thick)
+        tx = pt[0] + cand_r + 4
+        ty = pt[1] - cand_r - 2
+        tx = max(padding, min(tx, img_size - tw - padding))
+        ty = max(th + padding, min(ty, img_size - padding))
+
+        bg_pad = 2
+        cv2.rectangle(canvas,
+                      (tx - bg_pad, ty - th - bg_pad),
+                      (tx + tw + bg_pad, ty + bg_pad + baseline),
+                      (255, 255, 255), -1)
+        cv2.rectangle(canvas,
+                      (tx - bg_pad, ty - th - bg_pad),
+                      (tx + tw + bg_pad, ty + bg_pad + baseline),
+                      COLOR_CANDIDATE, 1)
+        cv2.putText(canvas, label, (tx, ty), font, font_scale,
+                    COLOR_CANDIDATE, font_thick, cv2.LINE_AA)
 
     # --- Output ---
     _, buffer = cv2.imencode('.png', canvas)
     b64_str = base64.b64encode(buffer).decode('utf-8')
     img_rgb_np = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-    
+
     if debug_save_path:
         os.makedirs(os.path.dirname(debug_save_path) if os.path.dirname(debug_save_path) else ".", exist_ok=True)
         cv2.imwrite(debug_save_path, canvas)
-    
+
     return b64_str, img_rgb_np
 
 def render_lrp_image(
