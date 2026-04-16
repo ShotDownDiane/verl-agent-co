@@ -4,6 +4,8 @@
 <b>See to Solve: A Geometry-Aware Vision-Language Agent for Real-World Routing Problem</b>
 </h3>
 
+![Framework](framework.png)
+
 ## 📝 Abstract
 
 Despite being foundational in logistics, routing problems remain computationally challenging under complex, real-world constraints. Classical heuristics typically lack explicit modeling of data distributions, necessitating expert-driven operator design and extensive manual tuning to ensure algorithmic reliability. Conversely, neural-network-based methods frequently struggle with distribution shifts across diverse urban environments, leading to poor generalization in real-world deployments. To address these dual limitations, we introduce **See-to-Solve (STS)**, a novel framework that employs a Vision-Language Model (VLM) as an autonomous agent to construct solutions for complex routing problems in an autoregressive manner. At each step, STS integrates multimodal observations to capture geometric structures and constraint-specific signals. To ensure logical grounding and mitigate hallucinations, we enforce an **Observation--Thought--Decision** reasoning protocol. Our approach further utilizes a two-stage sim-to-real pipeline: supervised fine-tuning on synthetic datasets, followed by GRPO-based reinforcement learning for rapid adaptation to target domains.
