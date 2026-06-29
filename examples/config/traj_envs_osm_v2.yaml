@@ -1,0 +1,71 @@
+# OSM-v2 Atomic Workspace environment configuration for ROLL agentic pipeline.
+# Supports BuildPlan and ImprovePlan atoms for city planning tasks.
+#
+# Uses "dataset mode": prompt_data_path points to a JSONL file where each row
+# contains a full per-instance config (data_source, atom, etc.). The env selects
+# an instance on each reset(seed) via seed-based indexing.
+
+max_tokens_per_step: 4096
+max_actions_per_traj: 15
+osm_v2_step_timeout: 30
+
+env_manager_cls: roll.pipeline.agentic.env_manager.osm_v2_env_manager.OsmV2EnvManager
+
+custom_env:
+  OsmV2BuildPlan:
+    env_type: osm_v2_atomic
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    use_thread_lock: true
+    agent_system_template: ""
+    agent_template: ""
+    env_config:
+      atom: BuildPlan
+      prompt_data_path: ${osm_v2_prompt_data}
+      max_turns: ${max_actions_per_traj}
+      run_root: ${osm_v2_run_root}
+      isolation: local
+      step_timeout_seconds: ${osm_v2_step_timeout}
+      workspace_prompt_config: ${osm_v2_scaffold_config}
+      editable_top_k: 80
+
+  OsmV2ImprovePlan:
+    env_type: osm_v2_atomic
+    max_steps: ${max_actions_per_traj}
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    use_thread_lock: true
+    agent_system_template: ""
+    agent_template: ""
+    env_config:
+      atom: ImprovePlan
+      prompt_data_path: ${osm_v2_prompt_data}
+      max_turns: ${max_actions_per_traj}
+      run_root: ${osm_v2_run_root}
+      isolation: local
+      step_timeout_seconds: ${osm_v2_step_timeout}
+      workspace_prompt_config: ${osm_v2_scaffold_config}
+      editable_top_k: 80
+
+  OsmV2Baseline:
+    env_type: osm_v2_baseline
+    max_steps: 30
+    max_tokens_per_step: ${max_tokens_per_step}
+    env_manager_cls: ${env_manager_cls}
+    use_thread_lock: true
+    agent_system_template: ""
+    agent_template: ""
+    env_config:
+      prompt_data_path: ${osm_v2_prompt_data}
+      max_turns: 30
+      run_root: ${osm_v2_run_root}
+      isolation: local
+      step_timeout_seconds: ${osm_v2_step_timeout}
+      workspace_prompt_config: ${osm_v2_scaffold_config}
+      editable_top_k: 80
+
+# Placeholder variables — override in pipeline config
+osm_v2_prompt_data: null
+osm_v2_scaffold_config: null
+osm_v2_run_root: /tmp/roll_osm_v2_atomic
